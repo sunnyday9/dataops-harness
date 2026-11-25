@@ -1,0 +1,23 @@
+name: dataops_ecommerce
+version: "1.0.0"
+config-version: 2
+
+profile: dataops_ecommerce
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  dataops_ecommerce:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table

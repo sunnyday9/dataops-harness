@@ -1,0 +1,94 @@
+assets:
+  raw_users:
+    engine: raw
+    layer: raw
+    path: lakehouse/raw/users/users.csv
+    upstream: []
+    pii_columns:
+      - email
+      - phone
+      - national_id
+    columns:
+      - user_id
+      - signup_date
+      - country
+      - email
+      - phone
+      - national_id
+
+  raw_exchange_rates:
+    engine: raw
+    layer: raw
+    path: lakehouse/raw/exchange_rates/exchange_rates.csv
+    upstream: []
+    pii_columns: []
+    columns:
+      - rate_date
+      - currency
+      - rate_to_usd
+
+  raw_orders:
+    engine: raw
+    layer: raw
+    path: lakehouse/raw/orders
+    upstream: []
+    pii_columns: []
+    columns:
+      - order_id
+      - user_id
+      - order_date
+      - currency
+      - amount_local
+      - status
+      - note
+
+  silver_users:
+    engine: spark
+    layer: silver
+    job_path: spark_jobs/build_silver_users.py
+    upstream:
+      - raw_users
+    partition_columns: []
+    pii_columns:
+      - email
+      - phone
+      - national_id
+    columns:
+      - user_id
+      - signup_date
+      - country
+      - email
+      - phone
+      - national_id
+
+  silver_exchange_rates:
+    engine: spark
+    layer: silver
+    job_path: spark_jobs/build_silver_exchange_rates.py
+    upstream:
+      - raw_exchange_rates
+    partition_columns: []
+    pii_columns: []
+    columns:
+      - rate_date
+      - currency
+      - rate_to_usd
+
+  silver_orders:
+    engine: spark
+    layer: silver
+    job_path: spark_jobs/build_silver_orders.py
+    upstream:
+      - raw_orders
+      - silver_users
+    partition_columns:
+      - order_date
+    pii_columns: []
+    columns:
+      - order_id
+      - user_id
+      - order_date
+      - currency
+      - amount_local
+      - status
+      - user_country

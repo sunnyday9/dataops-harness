@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: stg_orders
+    description: Staged orders read from Spark Delta silver_orders.
+    meta:
+      upstream_spark_table: silver_orders
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: user_id
+        tests:
+          - not_null
+      - name: order_date
+        tests:
+          - not_null
+      - name: currency
+        tests:
+          - not_null
+      - name: amount_local
+        tests:
+          - not_null
+
+  - name: stg_users
+    description: Staged users read from Spark Delta silver_users.
+    meta:
+      upstream_spark_table: silver_users
+    columns:
+      - name: user_id
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_exchange_rates
+    description: Staged FX rates read from Spark Delta silver_exchange_rates.
+    meta:
+      upstream_spark_table: silver_exchange_rates
+    columns:
+      - name: rate_date
+        tests:
+          - not_null
+      - name: currency
+        tests:
+          - not_null
+      - name: rate_to_usd
+        tests:
+          - not_null

@@ -1,0 +1,9 @@
+dataops_ecommerce:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('DATAOPS_DUCKDB_PATH', '../lakehouse/prod/mart/warehouse.duckdb') }}"
+      threads: 4
+      extensions:
+        - delta

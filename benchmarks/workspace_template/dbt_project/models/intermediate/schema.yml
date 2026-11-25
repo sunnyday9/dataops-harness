@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: int_orders_usd
+    description: Completed orders enriched with daily USD conversion.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: user_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_users')
+              field: user_id
+      - name: amount_usd
+        tests:
+          - not_null
