@@ -28,15 +28,17 @@ RunStatuses == {
     "DIAGNOSED",
     "ABORTED_THRASH",
     "ABORTED_BUDGET",
-    "ABORTED_ERROR"
+    "FAILED_ERROR"
 }
 
+\* Note: {"RESOLVED", "DIAGNOSED", "ABORTED_THRASH", "FAILED_ERROR"} are strictly absorbing;
+\* ABORTED_BUDGET permits out-of-band operator resume only when explicit extra_turns > 0.
 TerminalStatuses == {
     "RESOLVED",
     "DIAGNOSED",
     "ABORTED_THRASH",
     "ABORTED_BUDGET",
-    "ABORTED_ERROR"
+    "FAILED_ERROR"
 }
 
 TypeOK ==
@@ -97,9 +99,17 @@ BudgetAbort ==
     /\ UNCHANGED <<resolution_mode, turn, max_turns, rejection_count,
                    thrash_strikes, shadow_green, approval_packet_ready, prod_mutated>>
 
+CostOrWallClockBudgetAbort ==
+    /\ status = "RUNNING"
+    /\ turn < max_turns
+    /\ turn' = turn + 1
+    /\ status' = "ABORTED_BUDGET"
+    /\ UNCHANGED <<resolution_mode, max_turns, rejection_count,
+                   thrash_strikes, shadow_green, approval_packet_ready, prod_mutated>>
+
 UnexpectedErrorAbort ==
     /\ status = "RUNNING"
-    /\ status' = "ABORTED_ERROR"
+    /\ status' = "FAILED_ERROR"
     /\ UNCHANGED <<resolution_mode, turn, max_turns, rejection_count,
                    thrash_strikes, shadow_green, approval_packet_ready, prod_mutated>>
 
@@ -157,6 +167,16 @@ HiTLApprovePromote ==
     /\ UNCHANGED <<resolution_mode, turn, max_turns, rejection_count,
                    thrash_strikes, shadow_green, approval_packet_ready>>
 
+HiTLApproveRollback ==
+    /\ status = "AWAITING_APPROVAL"
+    /\ resolution_mode = "fix"
+    /\ shadow_green = TRUE
+    /\ approval_packet_ready = TRUE
+    /\ prod_mutated' = FALSE
+    /\ status' = "AWAITING_APPROVAL"
+    /\ UNCHANGED <<resolution_mode, turn, max_turns, rejection_count,
+                   thrash_strikes, shadow_green, approval_packet_ready>>
+
 TerminalStutter ==
     /\ status \in TerminalStatuses
     /\ UNCHANGED vars
@@ -166,6 +186,7 @@ Next ==
     \/ ToolStepThrashStrike
     \/ AntiThrashAbort
     \/ BudgetAbort
+    \/ CostOrWallClockBudgetAbort
     \/ UnexpectedErrorAbort
     \/ StopDiagnosisOnly
     \/ StopFixShadowFail
@@ -173,6 +194,7 @@ Next ==
     \/ CrashResumeCheckpoint
     \/ HiTLReject
     \/ HiTLApprovePromote
+    \/ HiTLApproveRollback
     \/ TerminalStutter
 
 Spec == Init /\ [][Next]_vars
