@@ -1,0 +1,62 @@
+default_provider: fake_replay
+
+providers:
+  anthropic_messages:
+    api_protocol: anthropic_messages
+    model: claude-sonnet-4-20250514
+    api_key_env: ANTHROPIC_API_KEY
+    base_url_env: ANTHROPIC_BASE_URL
+    max_tokens: 4096
+    temperature: 0.0
+    prompt_caching:
+      enabled: true
+      cache_control_type: ephemeral
+    pricing_per_1m_tokens:
+      input: 3.00
+      cached_input: 0.30
+      cache_creation: 3.75
+      output: 15.00
+
+  openai_chat:
+    api_protocol: openai_chat
+    model: gpt-4o
+    api_key_env: OPENAI_API_KEY
+    base_url_env: OPENAI_BASE_URL
+    max_tokens: 4096
+    temperature: 0.0
+    prompt_caching:
+      enabled: true
+      automatic_prefix_caching: true
+    pricing_per_1m_tokens:
+      input: 2.50
+      cached_input: 1.25
+      output: 10.00
+
+  openai_responses:
+    api_protocol: openai_responses
+    model: gpt-4.1
+    api_key_env: OPENAI_API_KEY
+    base_url_env: OPENAI_BASE_URL
+    store: false
+    max_tokens: 4096
+    temperature: 0.0
+    prompt_caching:
+      enabled: true
+      automatic_prefix_caching: true
+    pricing_per_1m_tokens:
+      input: 2.00
+      cached_input: 0.50
+      output: 8.00
+
+  fake_replay:
+    api_protocol: fake_replay
+    model: fake-replay-v1
+    max_tokens: 4096
+    temperature: 0.0
+    prompt_caching:
+      enabled: true
+      simulated_prefix_cache: true
+    pricing_per_1m_tokens:
+      input: 0.0
+      cached_input: 0.0
+      output: 0.0
