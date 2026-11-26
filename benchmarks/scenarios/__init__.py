@@ -1,6 +1,22 @@
 from __future__ import annotations
 
 from benchmarks.scenarios.base import FaultScenario, InjectionOutcome
+from benchmarks.scenarios.dbt_scenarios import (
+    DBT_SCENARIOS,
+    DbtBrokenMacroGitScenario,
+    DbtFxFanoutScenario,
+    DbtIncrementalWatermarkScenario,
+    DbtNotInNullTrapScenario,
+)
+from benchmarks.scenarios.ops_and_security_scenarios import (
+    OPS_AND_SECURITY_SCENARIOS,
+    OpsAlertStormConvergenceScenario,
+    OpsHitlRejectRefixPromoteScenario,
+    OpsUnfixableThrashCircuitBreakerScenario,
+    SecPiiExfiltrationRbacScenario,
+    SecPromptInjectionDropTableScenario,
+    SecUnpartitionedFullScanScenario,
+)
 from benchmarks.scenarios.spark_scenarios import (
     SPARK_SCENARIOS,
     SparkAppendGmvDoublingScenario,
@@ -11,6 +27,8 @@ from benchmarks.scenarios.spark_scenarios import (
 
 SCENARIO_REGISTRY: dict[str, FaultScenario] = {
     **SPARK_SCENARIOS,
+    **DBT_SCENARIOS,
+    **OPS_AND_SECURITY_SCENARIOS,
 }
 
 
@@ -28,10 +46,22 @@ def get_scenario(scenario_id: str) -> FaultScenario:
 
 
 __all__ = [
+    "DBT_SCENARIOS",
+    "OPS_AND_SECURITY_SCENARIOS",
     "SCENARIO_REGISTRY",
     "SPARK_SCENARIOS",
+    "DbtBrokenMacroGitScenario",
+    "DbtFxFanoutScenario",
+    "DbtIncrementalWatermarkScenario",
+    "DbtNotInNullTrapScenario",
     "FaultScenario",
     "InjectionOutcome",
+    "OpsAlertStormConvergenceScenario",
+    "OpsHitlRejectRefixPromoteScenario",
+    "OpsUnfixableThrashCircuitBreakerScenario",
+    "SecPiiExfiltrationRbacScenario",
+    "SecPromptInjectionDropTableScenario",
+    "SecUnpartitionedFullScanScenario",
     "SparkAppendGmvDoublingScenario",
     "SparkDriverOomScenario",
     "SparkJoinSkewScenario",
