@@ -1,0 +1,96 @@
+roles:
+  de:
+    resolution_mode: fix
+    allow_patch_paths:
+      - spark_jobs/
+      - dbt_project/
+    allow_read_spark_event_logs: true
+    sql_scope: all_layers
+    sql_mode: rows_redacted
+  da:
+    resolution_mode: diagnosis_only
+    allow_patch_paths: []
+    allow_read_spark_event_logs: false
+    sql_scope: mart_only
+    allowed_tables:
+      - fct_daily_gmv
+      - dim_user_ltv
+    sql_mode: rows_redacted
+  sre:
+    resolution_mode: fix
+    allow_patch_paths:
+      - spark_jobs/
+    allow_read_spark_event_logs: true
+    sql_scope: all_layers
+    sql_mode: aggregate_or_metadata_only
+
+pii_columns:
+  - email
+  - customer_email
+  - phone
+  - customer_phone
+  - national_id
+
+partitioned_tables:
+  silver_orders:
+    - order_date
+  fct_daily_gmv:
+    - order_date
+
+sql_guard:
+  max_limit: 50
+  allowed_top_level:
+    - SELECT
+    - WITH
+    - UNION
+    - EXPLAIN
+    - DESCRIBE
+  blocked_functions:
+    - read_text
+    - read_blob
+    - glob
+    - read_csv
+    - read_csv_auto
+    - read_json
+    - read_json_auto
+    - read_parquet
+    - delta_scan
+    - parquet_scan
+    - csv_scan
+  blocked_statements:
+    - DROP
+    - DELETE
+    - UPDATE
+    - INSERT
+    - COPY
+    - ATTACH
+    - DETACH
+    - PRAGMA
+    - INSTALL
+    - LOAD
+    - SET
+    - ALTER
+    - CREATE
+    - TRUNCATE
+    - MERGE
+    - CALL
+
+limits:
+  max_turns: 20
+  max_wall_clock_seconds: 300
+  max_cost_usd: 2.0
+  rejection_turn_extension: 8
+  max_rejections: 2
+  compactor_max_lines: 120
+  compactor_max_chars: 4000
+  compactor_fold_after_turns: 10
+  compactor_fold_budget_ratio: 0.65
+
+anti_thrash:
+  repeat_call_threshold: 2
+  error_stagnation_threshold: 2
+  file_oscillation_threshold: 3
+  strikes_before_abort: 2
+
+aggregator:
+  window_seconds: 900
