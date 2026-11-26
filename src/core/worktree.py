@@ -1,8 +1,55 @@
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
+
+_SYMLINK_MODE_PREFIXES = ("new file mode 120", "new mode 120", "old mode 120")
+
+
+def _clean_patch_path(raw: str) -> str:
+    cleaned = raw.strip()
+    if len(cleaned) >= 2 and cleaned[0] == '"' and cleaned[-1] == '"':
+        cleaned = cleaned[1:-1]
+    if cleaned.startswith(("a/", "b/")):
+        cleaned = cleaned[2:]
+    return cleaned
+
+
+def extract_raw_patch_paths(patch_text: str) -> list[str]:
+    """Extract all workspace-relative candidate file paths from a unified diff & reject symlinks."""
+    targets: list[str] = []
+
+    def _add(raw_path: str) -> None:
+        if not raw_path or raw_path == "/dev/null":
+            return
+        cleaned = _clean_patch_path(raw_path)
+        if cleaned and cleaned not in targets:
+            targets.append(cleaned)
+
+    for line in patch_text.splitlines():
+        if line.startswith(_SYMLINK_MODE_PREFIXES):
+            raise PermissionError("Symbolic link modifications in apply_patch are forbidden.")
+        if line.startswith("diff --git "):
+            try:
+                tokens = shlex.split(line)
+            except ValueError:
+                tokens = line.split()
+            for tok in tokens[2:]:
+                _add(tok)
+            continue
+        if line.startswith(("--- ", "+++ ")):
+            _add(line[4:].split("\t", 1)[0])
+            continue
+        for prefix in ("rename from ", "rename to ", "copy from ", "copy to "):
+            if line.startswith(prefix):
+                _add(line[len(prefix) :])
+                break
+
+    if not targets:
+        raise ValueError("Patch contains no valid target files.")
+    return targets
 
 _IGNORED_PREFIXES = (
     ".scratch/",

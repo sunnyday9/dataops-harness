@@ -9,9 +9,11 @@ from sqlglot import exp
 
 from src.core.context import RunState, ToolCall
 from src.core.policy import PoliciesConfig, RolePolicy, load_policies
+from src.core.worktree import extract_raw_patch_paths
 from src.hooks.base import PreToolDecision, PreToolUseHook
 from src.hooks.sql_guard import (
     extract_referenced_tables,
+    is_blocked_escape_func,
     is_explain_analyze,
     is_explain_statement,
     parse_single_statement,
@@ -69,6 +71,61 @@ def _is_inside_direct_agg_or_subquery(col: exp.Column, select_expr: exp.Select) 
 
 def _col_signature(col: exp.Column) -> str:
     return col.name.lower() if col.name else ""
+
+
+_DISALLOWED_AGG_MODE_FUNCS = frozenset(
+    {
+        "list",
+        "array_agg",
+        "string_agg",
+        "group_concat",
+        "first",
+        "last",
+        "any_value",
+        "arg_min",
+        "arg_max",
+        "arg_min_null",
+        "arg_max_null",
+        "min_by",
+        "max_by",
+        "histogram",
+        "map",
+        "struct_pack",
+        "json_group_array",
+        "json_group_object",
+    }
+)
+
+
+def _collect_tainted_pii_aliases(stmt: exp.Expression, pii_cols: set[str]) -> set[str]:
+    """Propagate PII taint through CTE chains and derived subqueries."""
+    tainted = set(pii_cols)
+    select_nodes: list[exp.Select] = []
+    with_node = stmt.args.get("with_") if isinstance(stmt, exp.Select) else None
+    if with_node is not None:
+        for cte in with_node.expressions:
+            select_nodes.extend(cte.find_all(exp.Select))
+    for sub in stmt.find_all(exp.Subquery):
+        select_nodes.extend(sub.find_all(exp.Select))
+
+    changed = True
+    while changed:
+        changed = False
+        for sel in select_nodes:
+            for proj in sel.expressions:
+                referenced = {
+                    _col_signature(col) for col in proj.find_all(exp.Column) if col.name
+                }
+                if referenced & tainted:
+                    out_name = (
+                        proj.alias.lower()
+                        if proj.alias
+                        else (_col_signature(proj) if isinstance(proj, exp.Column) else "")
+                    )
+                    if out_name and out_name not in tainted:
+                        tainted.add(out_name)
+                        changed = True
+    return tainted
 
 
 class PolicyRbacHook(PreToolUseHook):
@@ -144,7 +201,7 @@ class PolicyRbacHook(PreToolUseHook):
             slash_rel == "skills" or slash_rel.startswith("skills/")
         ):
             norm_skill = posixpath.normpath(slash_rel)
-            if norm_skill == ".." or norm_skill.startswith("../"):
+            if norm_skill != "skills" and not norm_skill.startswith("skills/"):
                 return PreToolDecision(
                     action="block", reason=f"Invalid skills path traversal: {raw_path!r}"
                 )
@@ -179,23 +236,42 @@ class PolicyRbacHook(PreToolUseHook):
         return PreToolDecision(action="allow")
 
     def _extract_patch_targets(self, patch_text: str) -> list[str]:
+        raw_paths = extract_raw_patch_paths(patch_text)
         targets: list[str] = []
-        for line in patch_text.splitlines():
-            if not line.startswith(("--- ", "+++ ")):
-                continue
-            raw_target = line[4:].split("\t", 1)[0].strip()
-            if raw_target == "/dev/null":
-                continue
-            if raw_target.startswith(("a/", "b/")):
-                raw_target = raw_target[2:]
+        for raw_target in raw_paths:
             rel = self._resolve_relative_path(raw_target, allow_dot=False)
             if rel == ".git" or rel.startswith(".git/"):
                 raise PermissionError(f"Patching .git/ is forbidden: {raw_target!r}")
             if rel not in targets:
                 targets.append(rel)
-        if not targets:
-            raise ValueError("Patch contains no valid target files.")
         return targets
+
+    def _check_git_inspect(
+        self, role: str, role_policy: RolePolicy, arguments: dict[str, Any]
+    ) -> PreToolDecision:
+        extra_args = [str(a) for a in (arguments.get("args") or [])]
+        for arg in extra_args:
+            lowered = arg.lower()
+            if (
+                arg in {"-c", "-C", "-o", "--no-index"}
+                or lowered.startswith(("-o", "--output", "--no-index", "--git-dir", "--work-tree"))
+            ):
+                return PreToolDecision(
+                    action="block", reason=f"Disallowed git_inspect flag: {arg!r}"
+                )
+            if arg.startswith(("/", "~")) or arg == ".." or "../" in arg or "/.." in arg or "..\\" in arg:
+                return PreToolDecision(
+                    action="block",
+                    reason=f"git_inspect path outside workspace is forbidden: {arg!r}",
+                )
+            if not role_policy.allow_read_spark_event_logs and self._targets_spark_event_log(
+                arg, None
+            ):
+                return PreToolDecision(
+                    action="block",
+                    reason=f"Role {role!r} cannot inspect Spark event logs via git ({arg!r}).",
+                )
+        return PreToolDecision(action="allow")
 
     def _check_apply_patch(
         self,
@@ -266,9 +342,8 @@ class PolicyRbacHook(PreToolUseHook):
                 f"(disallowed: {type(stmt).__name__.upper()})."
             )
 
-        # Reject CTE aliases or expressions exposing raw PII columns via GROUP BY smuggling.
-        if reason := self._check_cte_pii_aliases(role, stmt, pii_cols):
-            return reason
+        # Collect all PII aliases across multi-level CTEs and derived FROM subqueries.
+        tainted_cols = _collect_tainted_pii_aliases(stmt, pii_cols)
 
         # Validate scalar/comparison subqueries in projections or HAVING.
         for container in [*stmt.expressions, stmt.args.get("having")]:
@@ -278,17 +353,50 @@ class PolicyRbacHook(PreToolUseHook):
                 inner_q = sub.this
                 if (
                     isinstance(inner_q, (exp.Select, exp.SetOperation))
-                    and (reason := self._check_aggregate_only_stmt(role, inner_q, pii_cols))
+                    and (reason := self._check_aggregate_only_stmt(role, inner_q, tainted_cols))
                 ):
                     return reason
+
+        # Reject row/value-returning aggregates (LIST, STRING_AGG, FIRST, ANY_VALUE, etc.) and PII
+        # inside non-COUNT aggregates across SELECT and HAVING.
+        for container in [*stmt.expressions, stmt.args.get("having")]:
+            if container is None:
+                continue
+            for fn_node in container.find_all(exp.Func):
+                fn = fn_node.name.lower() if isinstance(fn_node, exp.Anonymous) else fn_node.sql_name().lower()
+                if fn in _DISALLOWED_AGG_MODE_FUNCS:
+                    return (
+                        f"Role {role!r} cannot use row/value-extracting function {fn!r} "
+                        "in aggregate_or_metadata_only mode."
+                    )
+                if isinstance(fn_node, exp.AggFunc) and not isinstance(fn_node, exp.Count):
+                    for col in fn_node.find_all(exp.Column):
+                        sig = _col_signature(col)
+                        if sig in tainted_cols:
+                            return (
+                                f"Role {role!r} cannot extract PII column {sig!r} via "
+                                f"{fn.upper()} in aggregate_or_metadata_only mode."
+                            )
 
         group_node = stmt.args.get("group")
         group_cols: set[str] = set()
         if group_node is not None:
             for g_expr in group_node.expressions:
+                if isinstance(g_expr, exp.Literal) and not g_expr.is_string:
+                    try:
+                        pos = int(g_expr.this) - 1
+                    except ValueError:
+                        pos = -1
+                    if 0 <= pos < len(stmt.expressions):
+                        for col in stmt.expressions[pos].find_all(exp.Column):
+                            if _col_signature(col) in tainted_cols:
+                                return (
+                                    f"Role {role!r} cannot GROUP BY PII column "
+                                    f"{_col_signature(col)!r} in aggregate_or_metadata_only mode."
+                                )
                 for col in g_expr.find_all(exp.Column):
                     col_name = _col_signature(col)
-                    if col_name in pii_cols:
+                    if col_name in tainted_cols:
                         return (
                             f"Role {role!r} cannot GROUP BY PII column {col_name!r} "
                             "in aggregate_or_metadata_only mode."
@@ -314,7 +422,7 @@ class PolicyRbacHook(PreToolUseHook):
                     and not _is_inside_direct_agg_or_subquery(node, stmt)
                 ):
                     col_name = _col_signature(node)
-                    if col_name in pii_cols:
+                    if col_name in tainted_cols:
                         return (
                             f"Role {role!r} cannot project PII column {col_name!r} "
                             "in aggregate_or_metadata_only mode."
@@ -330,36 +438,6 @@ class PolicyRbacHook(PreToolUseHook):
                 f"Role {role!r} requires an aggregate function (COUNT/SUM/AVG/MIN/MAX) "
                 "or EXPLAIN/DESCRIBE in aggregate_or_metadata_only mode."
             )
-        return None
-
-    @staticmethod
-    def _check_cte_pii_aliases(
-        role: str, stmt: exp.Select, pii_cols: set[str]
-    ) -> str | None:
-        with_node = stmt.args.get("with_")
-        if not with_node:
-            return None
-        group_node = stmt.args.get("group")
-        if group_node is None:
-            return None
-
-        outer_group_names = {
-            _col_signature(c) for c in group_node.find_all(exp.Column) if c.name
-        }
-        for cte in with_node.expressions:
-            if not isinstance(cte.this, exp.Select):
-                continue
-            for proj in cte.this.expressions:
-                alias = proj.alias.lower() if proj.alias else ""
-                if not alias or alias not in outer_group_names:
-                    continue
-                if any(
-                    col.name.lower() in pii_cols for col in proj.find_all(exp.Column) if col.name
-                ):
-                    return (
-                        f"Role {role!r} cannot GROUP BY aliased PII column {alias!r} "
-                        "in aggregate_or_metadata_only mode."
-                    )
         return None
 
     def _check_sql(
@@ -381,12 +459,16 @@ class PolicyRbacHook(PreToolUseHook):
                     )
                 if isinstance(node, exp.Func):
                     fn = node.name.lower() if isinstance(node, exp.Anonymous) else node.sql_name().lower()
-                    if fn.startswith(("read_", "parquet_")) or fn.endswith("_scan"):
+                    if (
+                        fn.startswith(("read_", "parquet_"))
+                        or fn.endswith("_scan")
+                        or is_blocked_escape_func(fn)
+                    ):
                         return PreToolDecision(
                             action="block",
                             reason=(
                                 f"Role {role!r} with sql_scope='mart_only' cannot call "
-                                f"file-reading function {fn!r}."
+                                f"restricted function {fn!r}."
                             ),
                         )
 
@@ -428,6 +510,8 @@ class PolicyRbacHook(PreToolUseHook):
             )
         if tool_call.name == "apply_patch":
             return self._check_apply_patch(state, role, role_policy, tool_call.arguments)
+        if tool_call.name == "git_inspect":
+            return self._check_git_inspect(role, role_policy, tool_call.arguments)
         if tool_call.name == "run_sql_readonly":
             return self._check_sql(role, role_policy, tool_call.arguments)
         return PreToolDecision(action="allow")

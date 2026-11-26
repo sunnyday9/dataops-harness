@@ -13,13 +13,45 @@ from src.adapters.base import LakehousePaths, LineageAdapterBase, StorageAdapter
 from src.adapters.model_adapter import ToolDefinition
 from src.adapters.spark_adapter import discover_java_home
 from src.core.context import ToolCall, ToolResult
+from src.core.worktree import extract_raw_patch_paths
 
 ALLOWED_GIT_SUBCOMMANDS = frozenset({"log", "diff", "blame", "show"})
-BLOCKED_GIT_FLAGS = ("--exec", "--upload-pack", "--receive-pack", "--ext-diff")
+BLOCKED_GIT_FLAGS = (
+    "--exec",
+    "--upload-pack",
+    "--receive-pack",
+    "--ext-diff",
+    "--no-index",
+    "--output",
+    "--git-dir",
+    "--work-tree",
+    "--config",
+    "--textconv",
+    "--paginate",
+    "--pager",
+    "--exec-path",
+    "--html-path",
+    "--man-path",
+    "--info-path",
+)
 MAX_READ_LINES = 200
 MAX_GREP_MATCHES = 200
 SKIP_GREP_DIRS = frozenset(
-    {".git", "lakehouse", "target", "logs", "dbt_packages", "__pycache__", ".venv"}
+    {
+        ".git",
+        "lakehouse",
+        "target",
+        "logs",
+        "spark_events",
+        "spark-events",
+        "event_logs",
+        "event-logs",
+        "spark_event_logs",
+        "spark-event-logs",
+        "dbt_packages",
+        "__pycache__",
+        ".venv",
+    }
 )
 
 
@@ -288,21 +320,28 @@ class ToolRegistry:
     def _run_spark_readonly_sql(self, sql: str) -> ToolResult:
         paths = LakehousePaths.from_workspace(self.workspace_dir)
         java_home = discover_java_home()
+        json_prefix = "__DATAOPS_SPARK_SQL_JSON__"
         helper_code = (
-            "import json, sys\n"
+            "import json, re, sys\n"
             "from pathlib import Path\n"
             "sys.path.insert(0, str(Path(sys.argv[1])))\n"
             "from spark_config import build_spark_session\n"
             "silver_dir = Path(sys.argv[2])\n"
             "sql_text = sys.argv[3]\n"
+            "json_prefix = sys.argv[4]\n"
             "spark = build_spark_session('readonly_probe')\n"
             "try:\n"
+            "    delta_paths = {}\n"
             "    for p in sorted(silver_dir.iterdir()):\n"
             "        if p.is_dir() and (p / '_delta_log').is_dir():\n"
+            "            delta_paths[p.name.lower()] = str(p.resolve())\n"
             "            spark.read.format('delta').load(str(p)).createOrReplaceTempView(p.name)\n"
+            "    m = re.match(r'^\\s*DESCRIBE\\s+(HISTORY|DETAIL)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*;?\\s*$', sql_text, re.IGNORECASE)\n"
+            "    if m and m.group(2).lower() in delta_paths:\n"
+            "        sql_text = f'DESCRIBE {m.group(1).upper()} delta.`{delta_paths[m.group(2).lower()]}`'\n"
             "    df = spark.sql(sql_text)\n"
             "    rows = [list(r) for r in df.limit(50).collect()]\n"
-            "    print(json.dumps({'columns': df.columns, 'rows': rows}, default=str))\n"
+            "    print(json_prefix + json.dumps({'columns': df.columns, 'rows': rows, 'row_count': len(rows)}, default=str))\n"
             "finally:\n"
             "    spark.stop()\n"
         )
@@ -319,6 +358,7 @@ class ToolRegistry:
                 str(paths.spark_jobs_dir),
                 str(paths.prod_silver_dir),
                 sql,
+                json_prefix,
             ],
             cwd=str(paths.spark_jobs_dir),
             env=env,
@@ -334,10 +374,19 @@ class ToolRegistry:
                 output=proc.stderr.strip() or proc.stdout.strip(),
                 is_error=True,
             )
+        # Strip Apache Ivy / Spark JVM stdout chatter emitted before the sentinel-prefixed JSON line.
+        json_output = next(
+            (
+                line[len(json_prefix) :]
+                for line in reversed(proc.stdout.splitlines())
+                if line.startswith(json_prefix)
+            ),
+            proc.stdout.strip(),
+        )
         return ToolResult(
             tool_call_id="",
             name="run_sql_readonly",
-            output=proc.stdout.strip(),
+            output=json_output,
         )
 
     def _tool_git_inspect(self, args: dict[str, Any]) -> ToolResult:
@@ -352,11 +401,28 @@ class ToolRegistry:
             )
         extra_args = [str(a) for a in (args.get("args") or [])]
         for flag in extra_args:
-            if flag == "-c" or any(flag.startswith(bad) for bad in BLOCKED_GIT_FLAGS):
+            lowered = flag.lower()
+            is_short_bad = (
+                len(flag) >= 2
+                and flag[0] == "-"
+                and flag[1] != "-"
+                and flag[1] in {"c", "C", "o"}
+            )
+            is_long_bad = any(
+                lowered == bad or lowered.startswith(f"{bad}=") for bad in BLOCKED_GIT_FLAGS
+            )
+            is_bad_path = (
+                flag.startswith(("/", "~"))
+                or flag == ".."
+                or "../" in flag
+                or "/.." in flag
+                or "..\\" in flag
+            )
+            if is_short_bad or is_long_bad or is_bad_path:
                 return ToolResult(
                     tool_call_id="",
                     name="git_inspect",
-                    output=f"Disallowed git flag: {flag!r}",
+                    output=f"Disallowed git flag or host path argument: {flag!r}",
                     is_error=True,
                     blocked=True,
                 )
@@ -377,23 +443,15 @@ class ToolRegistry:
         )
 
     def _extract_patch_targets(self, patch_text: str) -> list[str]:
+        raw_paths = extract_raw_patch_paths(patch_text)
         targets: list[str] = []
-        for line in patch_text.splitlines():
-            if not line.startswith(("--- ", "+++ ")):
-                continue
-            raw_target = line[4:].split("\t", 1)[0].strip()
-            if raw_target == "/dev/null":
-                continue
-            if raw_target.startswith(("a/", "b/")):
-                raw_target = raw_target[2:]
+        for raw_target in raw_paths:
             resolved = self._resolve_jailed_path(raw_target, allow_skills=False)
             rel = resolved.relative_to(self.workspace_dir).as_posix()
             if rel == ".git" or rel.startswith(".git/"):
                 raise PermissionError(f"Patching .git/ is forbidden: {raw_target}")
             if rel not in targets:
                 targets.append(rel)
-        if not targets:
-            raise ValueError("Patch contains no valid target files inside workspace/.")
         return targets
 
     def _tool_apply_patch(self, args: dict[str, Any]) -> ToolResult:

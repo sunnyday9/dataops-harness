@@ -58,6 +58,26 @@ def _canonical_test_key(entry: Any) -> str:
     return repr(entry)
 
 
+def _normalize_test_config(entry: Any) -> dict[str, Any]:
+    if isinstance(entry, str):
+        return {}
+    if not isinstance(entry, dict) or not entry:
+        return {}
+    raw_params = next(iter(entry.values()))
+    if not isinstance(raw_params, dict):
+        return {}
+    cfg: dict[str, Any] = {}
+    for key in ("enabled", "severity", "where", "limit"):
+        if key in raw_params:
+            cfg[key] = raw_params[key]
+    nested = raw_params.get("config")
+    if isinstance(nested, dict):
+        for key in ("enabled", "severity", "where", "limit"):
+            if key in nested:
+                cfg[key] = nested[key]
+    return cfg
+
+
 def _collect_schema_tests(dbt_dir: Path) -> Counter[tuple[str, str]]:
     counts: Counter[tuple[str, str]] = Counter()
     models_dir = dbt_dir / "models"
@@ -80,6 +100,41 @@ def _collect_schema_tests(dbt_dir: Path) -> Counter[tuple[str, str]]:
                 for test_entry in col.get("tests") or col.get("data_tests") or []:
                     counts[(f"{model_name}.{col_name}", _canonical_test_key(test_entry))] += 1
     return counts
+
+
+def _collect_schema_test_configs(dbt_dir: Path) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    configs: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    models_dir = dbt_dir / "models"
+    if not models_dir.is_dir():
+        return configs
+    for yml_path in sorted(models_dir.rglob("*.yml")):
+        loaded = yaml.safe_load(yml_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            continue
+        for model in loaded.get("models") or []:
+            if not isinstance(model, dict):
+                continue
+            model_name = str(model.get("name") or "")
+            for test_entry in model.get("tests") or model.get("data_tests") or []:
+                configs.setdefault((model_name, _canonical_test_key(test_entry)), []).append(
+                    _normalize_test_config(test_entry)
+                )
+            for col in model.get("columns") or []:
+                if not isinstance(col, dict):
+                    continue
+                col_name = str(col.get("name") or "")
+                for test_entry in col.get("tests") or col.get("data_tests") or []:
+                    configs.setdefault(
+                        (f"{model_name}.{col_name}", _canonical_test_key(test_entry)), []
+                    ).append(_normalize_test_config(test_entry))
+    return configs
+
+
+_NEUTRALIZED_TEST_RE = re.compile(
+    r"\b(?:where|and)\s+(?:1\s*=\s*0|0\s*=\s*1|false|null\s+is\s+not\s+null)\b|\blimit\s+0\b",
+    re.IGNORECASE,
+)
+_DBT_REF_SOURCE_RE = re.compile(r"\{\{\s*(?:ref|source)\s*\(", re.IGNORECASE)
 
 
 class HiddenRegressionOracle(Protocol):
@@ -116,7 +171,7 @@ class DefaultIntegrityOracle:
         prod_dbt = prod_workspace / "dbt_project"
         wt_dbt = worktree_dir / "dbt_project"
 
-        # 1. Singular dbt test files must not be deleted or emptied.
+        # 1. Singular dbt test files must not be deleted, emptied, or neutralized.
         prod_tests_dir = prod_dbt / "tests"
         wt_tests_dir = wt_dbt / "tests"
         if prod_tests_dir.is_dir():
@@ -124,16 +179,43 @@ class DefaultIntegrityOracle:
                 wt_sql = wt_tests_dir / test_sql.name
                 if not wt_sql.is_file() or not wt_sql.read_text(encoding="utf-8").strip():
                     reasons.append(f"Singular dbt test deleted or emptied: tests/{test_sql.name}")
+                    continue
+                prod_text = test_sql.read_text(encoding="utf-8")
+                wt_text = wt_sql.read_text(encoding="utf-8")
+                if " ".join(prod_text.split()) != " ".join(wt_text.split()):
+                    if _NEUTRALIZED_TEST_RE.search(wt_text):
+                        reasons.append(
+                            f"Singular dbt test neutralized with falsifying condition: tests/{test_sql.name}"
+                        )
+                    elif _DBT_REF_SOURCE_RE.search(prod_text) and not _DBT_REF_SOURCE_RE.search(wt_text):
+                        reasons.append(
+                            f"Singular dbt test stripped model/source refs: tests/{test_sql.name}"
+                        )
 
-        # 2. Schema tests in models/**/*.yml must not be removed.
+        # 2. Schema tests in models/**/*.yml must not be removed or weakened.
         prod_counts = _collect_schema_tests(prod_dbt)
         wt_counts = _collect_schema_tests(wt_dbt)
+        prod_cfgs = _collect_schema_test_configs(prod_dbt)
+        wt_cfgs = _collect_schema_test_configs(wt_dbt)
         for key, expected_cnt in prod_counts.items():
             if wt_counts.get(key, 0) < expected_cnt:
                 reasons.append(
                     f"Schema dbt test removed on {key[0]} ({key[1]}): "
                     f"expected >= {expected_cnt}, found {wt_counts.get(key, 0)}"
                 )
+                continue
+            p_list = prod_cfgs.get(key, [])
+            w_list = wt_cfgs.get(key, [])
+            for idx, w_cfg in enumerate(w_list):
+                p_cfg = p_list[idx] if idx < len(p_list) else {}
+                if w_cfg.get("enabled") is False and p_cfg.get("enabled") is not False:
+                    reasons.append(f"Schema dbt test disabled on {key[0]} ({key[1]}).")
+                if str(w_cfg.get("severity") or "").lower() == "warn" and str(p_cfg.get("severity") or "").lower() != "warn":
+                    reasons.append(f"Schema dbt test downgraded to warn on {key[0]} ({key[1]}).")
+                if w_cfg.get("limit") == 0 and p_cfg.get("limit") != 0:
+                    reasons.append(f"Schema dbt test neutralized with limit=0 on {key[0]} ({key[1]}).")
+                if "where" in w_cfg and w_cfg.get("where") != p_cfg.get("where"):
+                    reasons.append(f"Schema dbt test weakened with custom where filter on {key[0]} ({key[1]}).")
 
         # 3. Mart GMV conservation check if both mart tables exist in DuckDB.
         if shadow_duckdb_path.is_file():

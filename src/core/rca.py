@@ -66,32 +66,44 @@ class ApprovalPacket(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
-def _extract_balanced_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for idx in range(start, len(text)):
-        ch = text[idx]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : idx + 1]
-    return None
+def _extract_all_balanced_json_objects(text: str) -> list[str]:
+    """Scan `text` and return every top-level balanced `{...}` JSON substring."""
+    objs: list[str] = []
+    idx = 0
+    length = len(text)
+    while idx < length:
+        start = text.find("{", idx)
+        if start < 0:
+            break
+        depth = 0
+        in_string = False
+        escape = False
+        matched_end: int | None = None
+        for cur_idx in range(start, length):
+            ch = text[cur_idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    matched_end = cur_idx + 1
+                    break
+        if matched_end is not None:
+            objs.append(text[start:matched_end])
+            idx = matched_end
+        else:
+            break
+    return objs
 
 
 def parse_rca_report(candidate_output: str) -> RcaReport:
@@ -103,11 +115,11 @@ def parse_rca_report(candidate_output: str) -> RcaReport:
     candidates: list[str] = [match.group(1).strip() for match in _FENCED_JSON_RE.finditer(text)]
     if text.startswith("{"):
         candidates.append(text)
-    balanced = _extract_balanced_json_object(text)
-    if balanced and balanced not in candidates:
-        candidates.append(balanced)
+    for balanced in _extract_all_balanced_json_objects(text):
+        if balanced not in candidates:
+            candidates.append(balanced)
 
-    parsed_payload: dict[str, Any] | None = None
+    parsed_dicts: list[dict[str, Any]] = []
     last_json_err: str | None = None
     for blob in candidates:
         if not blob:
@@ -118,21 +130,25 @@ def parse_rca_report(candidate_output: str) -> RcaReport:
             last_json_err = str(exc)
             continue
         if isinstance(loaded, dict):
-            parsed_payload = loaded
-            break
+            parsed_dicts.append(loaded)
 
-    if parsed_payload is None:
+    if not parsed_dicts:
         detail = f" ({last_json_err})" if last_json_err else ""
         raise ValueError(
             "Output does not contain a valid JSON object matching the RcaReport schema"
             f"{detail}."
         )
 
-    try:
-        return RcaReport.model_validate(parsed_payload)
-    except ValidationError as exc:
-        issues = "; ".join(
-            f"{'.'.join(str(p) for p in err['loc']) or 'root'}: {err['msg']}"
-            for err in exc.errors()
-        )
-        raise ValueError(f"RCA Report validation failed: {issues}") from exc
+    last_validation_err: ValidationError | None = None
+    for payload in parsed_dicts:
+        try:
+            return RcaReport.model_validate(payload)
+        except ValidationError as exc:
+            last_validation_err = exc
+
+    assert last_validation_err is not None
+    issues = "; ".join(
+        f"{'.'.join(str(p) for p in err['loc']) or 'root'}: {err['msg']}"
+        for err in last_validation_err.errors()
+    )
+    raise ValueError(f"RCA Report validation failed: {issues}") from last_validation_err

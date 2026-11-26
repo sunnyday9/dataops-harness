@@ -319,6 +319,49 @@ class ContextCompactorHook(PostToolUseHook):
         )
         return min(policy_limit, state_limit)
 
+    def _active_elapsed_seconds(self, state: RunState, started_at: datetime, now: datetime) -> float:
+        raw_elapsed = max((now - started_at).total_seconds(), 0.0)
+        paused_seconds = float(state.metadata.get("paused_seconds", 0.0) or 0.0)
+        if isinstance(state.metadata.get("paused_at"), str):
+            paused_at = _parse_started_at(state.metadata["paused_at"])
+            if paused_at is not None:
+                paused_seconds += max((now - paused_at).total_seconds(), 0.0)
+        return max(raw_elapsed - max(paused_seconds, 0.0), 0.0)
+
+    def on_run_paused(self, state: RunState) -> None:
+        """Record pause timestamp while waiting for human approval so review delay is excluded."""
+        if "paused_at" not in state.metadata:
+            state.metadata["paused_at"] = self._current_utc().isoformat()
+
+    def on_run_resumed(self, state: RunState) -> None:
+        """Accumulate elapsed pause duration into `paused_seconds` when resuming."""
+        raw_paused_at = state.metadata.pop("paused_at", None)
+        if raw_paused_at is None:
+            return
+        paused_at = _parse_started_at(raw_paused_at)
+        if paused_at is None:
+            return
+        now = self._current_utc()
+        delta = max((now - paused_at).total_seconds(), 0.0)
+        state.metadata["paused_seconds"] = float(state.metadata.get("paused_seconds", 0.0) or 0.0) + delta
+
+    def check_turn_budget(self, state: RunState) -> str:
+        """Enforce cost and active wall-clock ceilings even on non-tool turns."""
+        now = self._current_utc()
+        started_at = self._ensure_started_at(state, now)
+        elapsed_seconds = self._active_elapsed_seconds(state, started_at, now)
+        if elapsed_seconds >= self.limits.max_wall_clock_seconds:
+            return (
+                f"Wall-clock budget exceeded ({elapsed_seconds:.1f}s >= "
+                f"{self.limits.max_wall_clock_seconds}s)."
+            )
+        if state.usage.cost_usd >= self.limits.max_cost_usd:
+            return (
+                f"Cost ceiling reached (${state.usage.cost_usd:.4f} >= "
+                f"${self.limits.max_cost_usd:.4f})."
+            )
+        return ""
+
     def _check_hard_ceilings(self, state: RunState, started_at: datetime, now: datetime) -> str:
         effective_max_turns = self._effective_max_turns(state)
         if state.turn >= effective_max_turns:
@@ -327,7 +370,7 @@ class ContextCompactorHook(PostToolUseHook):
                 f"with rejection_count={state.rejection_count})."
             )
 
-        elapsed_seconds = max((now - started_at).total_seconds(), 0.0)
+        elapsed_seconds = self._active_elapsed_seconds(state, started_at, now)
         if elapsed_seconds >= self.limits.max_wall_clock_seconds:
             return (
                 f"Wall-clock budget exceeded ({elapsed_seconds:.1f}s >= "

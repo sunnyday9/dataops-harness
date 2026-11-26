@@ -46,8 +46,33 @@ _ALWAYS_BLOCKED_FILE_FUNCS = frozenset(
         "postgres_scan",
         "mysql_scan",
         "http_get",
+        "query",
+        "query_table",
+        "json_execute_serialized_sql",
+        "json_serialize_sql",
+        "sniff_csv",
+        "current_setting",
+        "iceberg_scan",
+        "iceberg_metadata",
+        "iceberg_snapshots",
+        "delta_metadata",
+        "xlsx_scan",
+        "st_read",
+        "read_xlsx",
+        "read_ndjson",
+        "read_ndjson_auto",
+        "read_ndjson_objects",
     }
 )
+
+
+def is_blocked_escape_func(name: str) -> bool:
+    """Return True if SQL function `name` invokes dynamic SQL, metadata, or external escapes."""
+    lowered = name.lower()
+    return (
+        lowered in _ALWAYS_BLOCKED_FILE_FUNCS
+        or lowered.startswith(("pragma_", "duckdb_"))
+    )
 
 _LAKEHOUSE_RELATIVE_PREFIX = "workspace/lakehouse/"
 
@@ -261,16 +286,33 @@ def _predicate_filters_target(
         high = cur.args.get("high")
         if (
             ref is not None
+            and low is not None
+            and high is not None
             and not isinstance(low, exp.Null)
             and not isinstance(high, exp.Null)
+            and not _has_any_column(low)
+            and not _has_any_column(high)
         ):
             return _col_matches_target(ref, qualifiers, partition_cols, allow_unqualified)
         return False
 
     if isinstance(cur, exp.In):
         ref = _extract_col_ref(cur.this)
-        has_values = bool(cur.expressions) or bool(cur.args.get("query"))
-        if ref is not None and has_values:
+        sub_query = cur.args.get("query")
+        if sub_query is not None:
+            return ref is not None and _col_matches_target(
+                ref, qualifiers, partition_cols, allow_unqualified
+            )
+        vals = cur.expressions or []
+        if (
+            ref is not None
+            and vals
+            and all(
+                not isinstance(_strip_parens_and_casts(v), exp.Null)
+                and not _has_any_column(v)
+                for v in vals
+            )
+        ):
             return _col_matches_target(ref, qualifiers, partition_cols, allow_unqualified)
         return False
 
@@ -285,30 +327,27 @@ def _predicate_filters_target(
             and not right_is_null
             and _col_matches_target(left_ref, qualifiers, partition_cols, allow_unqualified)
         ):
-            if right_ref is not None and _col_matches_target(
-                right_ref, qualifiers, partition_cols, allow_unqualified
-            ):
-                return False  # Reject tautologies like o.order_date = o.order_date.
-            if right_ref is not None and isinstance(cur, exp.EQ):
-                if equivalences is not None:
+            if right_ref is not None:
+                if _col_matches_target(right_ref, qualifiers, partition_cols, allow_unqualified):
+                    return False  # Reject tautologies like o.order_date = o.order_date.
+                if isinstance(cur, exp.EQ) and equivalences is not None:
                     equivalences.setdefault(left_ref, set()).add(right_ref)
-                return False  # Resolved through directed constraint propagation below.
-            return True
+                return False
+            # Reject expression tautologies like COALESCE(order_date, ...).
+            return not _has_any_column(cur.expression)
 
         if (
             right_ref is not None
             and not left_is_null
             and _col_matches_target(right_ref, qualifiers, partition_cols, allow_unqualified)
         ):
-            if left_ref is not None and _col_matches_target(
-                left_ref, qualifiers, partition_cols, allow_unqualified
-            ):
-                return False
-            if left_ref is not None and isinstance(cur, exp.EQ):
-                if equivalences is not None:
+            if left_ref is not None:
+                if _col_matches_target(left_ref, qualifiers, partition_cols, allow_unqualified):
+                    return False
+                if isinstance(cur, exp.EQ) and equivalences is not None:
                     equivalences.setdefault(right_ref, set()).add(left_ref)
                 return False
-            return True
+            return not _has_any_column(cur.this)
     return False
 
 
@@ -333,13 +372,30 @@ def _extract_direct_filtered_cols(pred: exp.Expression) -> set[tuple[str, str]]:
         ref = _extract_col_ref(cur.this)
         low = cur.args.get("low")
         high = cur.args.get("high")
-        if ref is not None and not isinstance(low, exp.Null) and not isinstance(high, exp.Null):
+        if (
+            ref is not None
+            and low is not None
+            and high is not None
+            and not isinstance(low, exp.Null)
+            and not isinstance(high, exp.Null)
+            and not _has_any_column(low)
+            and not _has_any_column(high)
+        ):
             return {ref}
         return set()
     if isinstance(cur, exp.In):
         ref = _extract_col_ref(cur.this)
-        has_values = bool(cur.expressions) or bool(cur.args.get("query"))
-        return {ref} if ref is not None and has_values else set()
+        if ref is None:
+            return set()
+        if cur.args.get("query") is not None:
+            return {ref}
+        vals = cur.expressions or []
+        if vals and all(
+            not isinstance(_strip_parens_and_casts(v), exp.Null) and not _has_any_column(v)
+            for v in vals
+        ):
+            return {ref}
+        return set()
     if isinstance(cur, (exp.EQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         left_ref = _extract_col_ref(cur.this)
         right_ref = _extract_col_ref(cur.expression)
@@ -387,17 +443,29 @@ def _is_direct_star_in_select(star: exp.Star, select_expr: exp.Select) -> bool:
     return parent is select_expr
 
 
+_ROW_EXPANDING_FUNCS = frozenset({"unnest", "explode", "generate_series", "range"})
+
+
 def _is_pure_scalar_or_aggregate(stmt: exp.Expression) -> bool:
     if not isinstance(stmt, exp.Select):
         return False
     if not stmt.args.get("from_") and not stmt.args.get("joins"):
-        return True
+        return not any(
+            isinstance(node, (exp.Unnest, exp.Explode))
+            or (isinstance(node, exp.Func) and _func_name(node) in _ROW_EXPANDING_FUNCS)
+            for expr in stmt.expressions
+            for node in expr.walk()
+        )
     if stmt.args.get("group"):
         return False
 
     has_direct_agg = False
     for expr in stmt.expressions:
         for node in expr.walk():
+            if isinstance(node, (exp.Unnest, exp.Explode)):
+                return False
+            if isinstance(node, exp.Func) and _func_name(node) in _ROW_EXPANDING_FUNCS:
+                return False
             if isinstance(node, exp.Star) and _is_direct_star_in_select(node, stmt):
                 return False
             if isinstance(node, exp.AggFunc) and _is_direct_agg_in_select(node, stmt):
@@ -493,7 +561,7 @@ class SqlGuardHook(PreToolUseHook):
                 fn = _func_name(node)
                 if fn in blocked_funcs:
                     return f"Blocked SQL function: {fn}"
-                if fn in _ALWAYS_BLOCKED_FILE_FUNCS:
+                if is_blocked_escape_func(fn):
                     return f"Blocked external/system SQL function: {fn}"
                 if _is_file_reading_func(fn):
                     literals = _extract_string_literals(node)
@@ -521,8 +589,15 @@ class SqlGuardHook(PreToolUseHook):
 
     def _check_limits(self, stmt: exp.Expression) -> str | None:
         max_limit = self.policies.sql_guard.max_limit
-        for limit_node in stmt.find_all(exp.Limit):
-            expr = limit_node.expression
+        for limit_node in [*stmt.find_all(exp.Limit), *stmt.find_all(exp.Fetch)]:
+            limit_options = limit_node.args.get("limit_options")
+            if limit_options is not None and limit_options.args.get("percent"):
+                return f"PERCENT row limits are forbidden; use explicit LIMIT <= {max_limit}."
+            expr = (
+                limit_node.args.get("count")
+                if isinstance(limit_node, exp.Fetch)
+                else limit_node.expression
+            )
             if not isinstance(expr, exp.Literal) or expr.is_string:
                 return f"Explicit LIMIT must be an integer <= {max_limit}."
             try:
@@ -540,6 +615,8 @@ class SqlGuardHook(PreToolUseHook):
         qualifiers: set[str],
         partition_cols: set[str],
     ) -> bool:
+        if not scope.is_root:
+            return False
         select_expr = scope.expression
         if not isinstance(select_expr, exp.Select):
             return False

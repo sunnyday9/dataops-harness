@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -92,6 +93,29 @@ class PromotionService:
             for rel in changed_files
         }
 
+        pre_head = subprocess.run(
+            ["git", "-C", str(self.prod_workspace), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        prod_paths = LakehousePaths.from_workspace(self.prod_workspace)
+        backup_duckdb = self.runs_dir / run_id / ".prod_warehouse_backup.duckdb"
+        if prod_paths.prod_duckdb_path.is_file():
+            backup_duckdb.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(prod_paths.prod_duckdb_path, backup_duckdb)
+
+        def _rollback_prod() -> None:
+            subprocess.run(
+                ["git", "-C", str(self.prod_workspace), "reset", "--hard", pre_head],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if backup_duckdb.is_file():
+                prod_paths.prod_duckdb_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup_duckdb, prod_paths.prod_duckdb_path)
+
         normalized_diff = diff_text if diff_text.endswith("\n") else diff_text + "\n"
         check_proc = subprocess.run(
             ["git", "-C", str(self.prod_workspace), "apply", "--check", "-"],
@@ -101,112 +125,122 @@ class PromotionService:
             check=False,
         )
         if check_proc.returncode != 0:
+            if backup_duckdb.is_file():
+                backup_duckdb.unlink()
             raise RuntimeError(
                 f"Production git apply --check failed: {check_proc.stderr.strip()}"
             )
 
-        apply_proc = subprocess.run(
-            ["git", "-C", str(self.prod_workspace), "apply", "-"],
-            input=normalized_diff,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if apply_proc.returncode != 0:
-            raise RuntimeError(f"Production git apply failed: {apply_proc.stderr.strip()}")
-
-        if changed_files:
-            subprocess.run(
-                ["git", "-C", str(self.prod_workspace), "add", "--", *changed_files],
-                check=True,
-                capture_output=True,
+        try:
+            apply_proc = subprocess.run(
+                ["git", "-C", str(self.prod_workspace), "apply", "-"],
+                input=normalized_diff,
                 text=True,
-            )
-        else:
-            subprocess.run(
-                ["git", "-C", str(self.prod_workspace), "add", "-A"],
-                check=True,
                 capture_output=True,
-                text=True,
+                check=False,
             )
+            if apply_proc.returncode != 0:
+                raise RuntimeError(f"Production git apply failed: {apply_proc.stderr.strip()}")
 
-        commit_msg = (
-            f"fix(dataops): resolve {state.incident.incident_id} (run {run_id})"
-        )
-        commit_proc = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.prod_workspace),
-                "-c",
-                "user.name=DataOps-Harness",
-                "-c",
-                "user.email=harness@dataops.local",
-                "commit",
-                "-m",
-                commit_msg,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if commit_proc.returncode != 0:
-            raise RuntimeError(
-                f"Production git commit failed: {commit_proc.stderr.strip() or commit_proc.stdout.strip()}"
-            )
-
-        commit_sha = subprocess.run(
-            ["git", "-C", str(self.prod_workspace), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-
-        prod_paths = LakehousePaths.from_workspace(self.prod_workspace)
-        lineage = self.lineage_adapter or LineageAdapter.from_workspace(self.prod_workspace)
-        affected = lineage.affected_downstream(changed_files)
-        events_dir = self.runs_dir / run_id / "prod_spark_events"
-        spark_runner = self._custom_spark_runner or SparkJobRunner(event_log_dir=events_dir)
-
-        incremental_changed = any(
-            rel.startswith("dbt_project/models/")
-            and rel.endswith(".sql")
-            and before_inc_blocks.get(rel, [])
-            != (
-                extract_incremental_blocks(
-                    (self.prod_workspace / rel).read_text(encoding="utf-8")
+            if changed_files:
+                subprocess.run(
+                    ["git", "-C", str(self.prod_workspace), "add", "--", *changed_files],
+                    check=True,
+                    capture_output=True,
+                    text=True,
                 )
-                if (self.prod_workspace / rel).is_file()
-                else []
-            )
-            for rel in changed_files
-        )
+            else:
+                subprocess.run(
+                    ["git", "-C", str(self.prod_workspace), "add", "-A"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
 
-        (
-            spark_runs,
-            _overrides,
-            dbt_run_ok,
-            dbt_test_ok,
-            _dbt_out,
-            _dbt_err,
-            failures,
-        ) = execute_pipeline_subset(
-            code_workspace=self.prod_workspace,
-            raw_dir=prod_paths.raw_dir,
-            prod_silver_dir=prod_paths.prod_silver_dir,
-            target_silver_dir=prod_paths.prod_silver_dir,
-            target_duckdb_path=prod_paths.prod_duckdb_path,
-            changed_files=changed_files,
-            affected_spark_jobs=affected.spark_jobs,
-            affected_dbt_models=affected.dbt_models,
-            spark_runner=spark_runner,
-            dbt_executor=self._dbt_executor,
-            full_refresh=not incremental_changed,
-        )
-        if failures or not dbt_run_ok or not dbt_test_ok:
-            raise RuntimeError(
-                "Production post-commit verification failed: " + "; ".join(failures)
+            commit_msg = (
+                f"fix(dataops): resolve {state.incident.incident_id} (run {run_id})"
             )
+            commit_proc = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.prod_workspace),
+                    "-c",
+                    "user.name=DataOps-Harness",
+                    "-c",
+                    "user.email=harness@dataops.local",
+                    "commit",
+                    "-m",
+                    commit_msg,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if commit_proc.returncode != 0:
+                raise RuntimeError(
+                    f"Production git commit failed: {commit_proc.stderr.strip() or commit_proc.stdout.strip()}"
+                )
+
+            commit_sha = subprocess.run(
+                ["git", "-C", str(self.prod_workspace), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            lineage = self.lineage_adapter or LineageAdapter.from_workspace(self.prod_workspace)
+            affected = lineage.affected_downstream(changed_files)
+            events_dir = self.runs_dir / run_id / "prod_spark_events"
+            spark_runner = self._custom_spark_runner or SparkJobRunner(event_log_dir=events_dir)
+
+            incremental_changed = any(
+                rel.startswith("dbt_project/models/")
+                and rel.endswith(".sql")
+                and before_inc_blocks.get(rel, [])
+                != (
+                    extract_incremental_blocks(
+                        (self.prod_workspace / rel).read_text(encoding="utf-8")
+                    )
+                    if (self.prod_workspace / rel).is_file()
+                    else []
+                )
+                for rel in changed_files
+            )
+
+            (
+                spark_runs,
+                _overrides,
+                dbt_run_ok,
+                dbt_test_ok,
+                _dbt_out,
+                _dbt_err,
+                failures,
+            ) = execute_pipeline_subset(
+                code_workspace=self.prod_workspace,
+                raw_dir=prod_paths.raw_dir,
+                prod_silver_dir=prod_paths.prod_silver_dir,
+                target_silver_dir=prod_paths.prod_silver_dir,
+                target_duckdb_path=prod_paths.prod_duckdb_path,
+                changed_files=changed_files,
+                affected_spark_jobs=affected.spark_jobs,
+                affected_dbt_models=affected.dbt_models,
+                spark_runner=spark_runner,
+                dbt_executor=self._dbt_executor,
+                full_refresh=not incremental_changed,
+            )
+            if failures or not dbt_run_ok or not dbt_test_ok:
+                raise RuntimeError(
+                    "Production post-commit verification failed: " + "; ".join(failures)
+                )
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            _rollback_prod()
+            if backup_duckdb.is_file():
+                backup_duckdb.unlink()
+            raise
+
+        if backup_duckdb.is_file():
+            backup_duckdb.unlink()
 
         result = PromotionResult(
             run_id=run_id,
@@ -277,7 +311,12 @@ class PromotionService:
                 state,
                 detail={"attempt": state.rejection_count, "reason": cleaned_reason},
             )
-            return loop.resume(run_id, extra_message=feedback, extra_turns=ext)
+            return loop.resume(
+                run_id,
+                extra_message=feedback,
+                extra_turns=ext,
+                is_rejection_extension=True,
+            )
 
         state.max_turns += ext
         state.messages.append(Message(role="user", content=feedback))

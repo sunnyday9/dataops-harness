@@ -21,11 +21,14 @@ _PLACEHOLDER_SPLIT_RE = re.compile(r"(<(?:EMAIL|PHONE|ID)_[0-9a-f]{8}>)")
 _EMAIL_RE = re.compile(
     r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9._%+-])"
 )
-# Match 18-digit PRC resident IDs and XXX-XX-XXXX SSNs BEFORE phone numbers.
+# Match 18-digit PRC resident IDs, XXX-XX-XXXX SSNs, and synthetic NID-XXXXXX-XX IDs BEFORE phone numbers.
 _PRC_ID_RE = re.compile(
     r"(?<!\d)[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)"
 )
 _SSN_RE = re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")
+_LAKEHOUSE_NID_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])NID-\d{4,12}-\d{2,6}(?![A-Za-z0-9_-])", re.IGNORECASE
+)
 
 _CN_MOBILE_RE = re.compile(
     r"(?<!\d)(?:\+?86[-.\s]?)?1[3-9]\d(?:\d{8}|[-.\s]\d{4}[-.\s]\d{4})(?!\d)"
@@ -90,6 +93,9 @@ class PiiRedactorHook(PostToolUseHook):
         out = _SSN_RE.sub(
             lambda m: self.pseudonymize(state, "ID", m.group(0)), out
         )
+        out = _LAKEHOUSE_NID_RE.sub(
+            lambda m: self.pseudonymize(state, "ID", m.group(0)), out
+        )
         out = _CN_MOBILE_RE.sub(
             lambda m: self.pseudonymize(state, "PHONE", m.group(0)), out
         )
@@ -151,28 +157,65 @@ class PiiRedactorHook(PostToolUseHook):
             for col_idx, cell in enumerate(row):
                 if cell is None:
                     continue
-                if col_idx in col_categories:
-                    cell_text = str(cell)
-                    if cell_text.strip() and not _ALREADY_REDACTED_EXACT_RE.match(
-                        cell_text.strip()
-                    ):
-                        pseudonym = self.pseudonymize(
-                            state, col_categories[col_idx], cell_text
-                        )
-                        if pseudonym != cell:
-                            updated_row[col_idx] = pseudonym
-                            changed = True
-                elif isinstance(cell, str):
-                    redacted_cell = self.redact_text(state, cell)
-                    if redacted_cell != cell:
-                        updated_row[col_idx] = redacted_cell
-                        changed = True
+                redacted_val, val_changed = self._redact_json_value(
+                    state, cell, forced_category=col_categories.get(col_idx)
+                )
+                if val_changed:
+                    updated_row[col_idx] = redacted_val
+                    changed = True
             new_rows.append(updated_row)
 
         if not changed:
             return raw_output
         payload["rows"] = new_rows
         return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    def _redact_json_value(
+        self,
+        state: RunState,
+        value: Any,
+        *,
+        forced_category: PiiCategory | None = None,
+    ) -> tuple[Any, bool]:
+        """Recursively redact nested SQL cells (lists, dicts/structs, and string leaves)."""
+        if value is None:
+            return value, False
+        if isinstance(value, list):
+            changed = False
+            out_list: list[Any] = []
+            for item in value:
+                new_item, item_changed = self._redact_json_value(
+                    state, item, forced_category=forced_category
+                )
+                if item_changed:
+                    changed = True
+                out_list.append(new_item)
+            return out_list, changed
+        if isinstance(value, dict):
+            changed = False
+            out_dict: dict[Any, Any] = {}
+            for k, v in value.items():
+                key_cat = (
+                    _classify_column_category(str(k))
+                    if str(k).lower() in self._pii_columns
+                    else forced_category
+                )
+                new_v, v_changed = self._redact_json_value(
+                    state, v, forced_category=key_cat
+                )
+                if v_changed:
+                    changed = True
+                out_dict[k] = new_v
+            return out_dict, changed
+        if forced_category is not None:
+            text = str(value)
+            if text.strip() and not _ALREADY_REDACTED_EXACT_RE.match(text.strip()):
+                return self.pseudonymize(state, forced_category, text), True
+            return value, False
+        if isinstance(value, str):
+            redacted = self.redact_text(state, value)
+            return redacted, redacted != value
+        return value, False
 
     def on_post_tool_use(
         self, state: RunState, tool_call: ToolCall, result: ToolResult

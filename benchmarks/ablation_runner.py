@@ -44,7 +44,7 @@ from src.core.context import (
     UserContext,
 )
 from src.core.loop import DEFAULT_STATIC_PROMPT, HarnessLoop
-from src.core.playbooks import build_static_system_prompt
+from src.core.playbooks import DEFAULT_SKILLS_DIR, build_static_system_prompt
 from src.core.policy import PoliciesConfig, load_policies
 from src.core.promotion import PromotionService
 from src.core.rca import RcaReport
@@ -291,10 +291,19 @@ class _NoCacheModelAdapter(ModelAdapter):
         )
 
 
-def _clone_git_workspace(source_ws: Path, target_ws: Path) -> Path:
-    """Clone an isolated sandbox workspace with fresh local git history."""
+def _clone_git_workspace(
+    source_ws: Path, target_ws: Path, *, preserve_git: bool = False
+) -> Path:
+    """Clone an isolated sandbox workspace, optionally preserving git commit history."""
     if target_ws.exists():
         shutil.rmtree(target_ws)
+    if preserve_git and (source_ws / ".git").exists():
+        shutil.copytree(
+            source_ws,
+            target_ws,
+            ignore=shutil.ignore_patterns(".scratch", ".user.yml", "__pycache__"),
+        )
+        return target_ws
     shutil.copytree(
         source_ws,
         target_ws,
@@ -894,6 +903,7 @@ class AblationBenchmarkRunner:
                 tool_registry=_ArmToolRegistry(
                     arm_ws,
                     enable_lineage_tool=arm.enable_lineage_tool,
+                    skills_dir=DEFAULT_SKILLS_DIR if arm.enable_playbooks else None,
                     duckdb_adapter=DuckDBAdapter(paths),
                 ),
                 hooks=_build_arm_hooks(arm, arm_ws, self.policies),
@@ -997,6 +1007,7 @@ class AblationBenchmarkRunner:
                 tool_registry=_ArmToolRegistry(
                     arm_ws,
                     enable_lineage_tool=arm.enable_lineage_tool,
+                    skills_dir=DEFAULT_SKILLS_DIR if arm.enable_playbooks else None,
                     duckdb_adapter=DuckDBAdapter(paths),
                 ),
                 hooks=_build_arm_hooks(arm, arm_ws, self.policies),
@@ -1118,10 +1129,12 @@ class AblationBenchmarkRunner:
                     tool_registry=_ArmToolRegistry(
                         arm_ws,
                         enable_lineage_tool=arm.enable_lineage_tool,
+                        skills_dir=DEFAULT_SKILLS_DIR if arm.enable_playbooks else None,
                         duckdb_adapter=DuckDBAdapter(paths),
                     ),
                     hooks=_build_arm_hooks(arm, arm_ws, self.policies),
                     runs_dir=arm_runs_dir,
+                    policies=self.policies,
                     static_system_prompt=(
                         build_static_system_prompt()
                         if arm.enable_playbooks
@@ -1232,10 +1245,11 @@ class AblationBenchmarkRunner:
                 )
             ),
         ]
+        last_adapter: ModelAdapter | None = None
         if arm.enable_alert_aggregator:
             aggregator = AlertStormAggregator(lineage)
             incidents = aggregator.ingest(base_outcome.raw_alerts)
-            adapter = _make_adapter(
+            last_adapter = _make_adapter(
                 self.provider,
                 self.models_config_path,
                 arm,
@@ -1244,10 +1258,11 @@ class AblationBenchmarkRunner:
                 outcome=base_outcome,
             )
             loop = HarnessLoop(
-                model_adapter=adapter,
+                model_adapter=last_adapter,
                 tool_registry=_ArmToolRegistry(
                     arm_ws,
                     enable_lineage_tool=arm.enable_lineage_tool,
+                    skills_dir=DEFAULT_SKILLS_DIR if arm.enable_playbooks else None,
                     lineage_adapter=lineage,
                     duckdb_adapter=DuckDBAdapter(paths),
                 ),
@@ -1264,7 +1279,7 @@ class AblationBenchmarkRunner:
         else:
             states = []
             for idx, raw_alert in enumerate(base_outcome.raw_alerts):
-                adapter = _make_adapter(
+                last_adapter = _make_adapter(
                     self.provider,
                     self.models_config_path,
                     arm,
@@ -1273,10 +1288,11 @@ class AblationBenchmarkRunner:
                     outcome=base_outcome,
                 )
                 loop = HarnessLoop(
-                    model_adapter=adapter,
+                    model_adapter=last_adapter,
                     tool_registry=_ArmToolRegistry(
                         arm_ws,
                         enable_lineage_tool=arm.enable_lineage_tool,
+                        skills_dir=DEFAULT_SKILLS_DIR if arm.enable_playbooks else None,
                         lineage_adapter=lineage if arm.enable_lineage_tool else None,
                         duckdb_adapter=DuckDBAdapter(paths),
                     ),
@@ -1301,8 +1317,13 @@ class AblationBenchmarkRunner:
                 )
 
         converged = len(states) == 1
+        pricing = (
+            last_adapter.config.pricing_per_1m_tokens
+            if last_adapter is not None
+            else PricingConfig()
+        )
         in_t, cache_t, out_t, cost, proj_cost, hit_rate = _aggregate_usage(
-            states, PricingConfig()
+            states, pricing
         )
         return ScenarioRunRecord(
             arm_id=arm.arm_id,
@@ -1361,10 +1382,13 @@ class AblationBenchmarkRunner:
         loop = HarnessLoop(
             model_adapter=adapter,
             tool_registry=_ArmToolRegistry(
-                arm_ws, enable_lineage_tool=arm.enable_lineage_tool
+                arm_ws,
+                enable_lineage_tool=arm.enable_lineage_tool,
+                skills_dir=DEFAULT_SKILLS_DIR if arm.enable_playbooks else None,
             ),
             hooks=_build_arm_hooks(arm, arm_ws, self.policies),
             runs_dir=arm_runs_dir,
+            policies=self.policies,
             static_system_prompt=(
                 build_static_system_prompt() if arm.enable_playbooks else DEFAULT_STATIC_PROMPT
             ),
@@ -1411,9 +1435,11 @@ class AblationBenchmarkRunner:
         sid = scenario.scenario_id
         run_id = f"{arm.arm_id}-{sid}"
         wt = RunWorktreeManager.create(arm_ws, arm_runs_dir, run_id)
+        if (arm_ws / "incidents").is_dir():
+            shutil.copytree(arm_ws / "incidents", wt / "incidents", dirs_exist_ok=True)
         oracle = scenario.build_oracle(base_outcome)
-        lineage = LineageAdapter.from_workspace(wt)
-        paths = LakehousePaths.from_workspace(wt)
+        lineage = LineageAdapter.from_workspace(arm_ws)
+        paths = LakehousePaths.from_workspace(arm_ws)
         verifier = ShadowOverlayVerifier(arm_ws, arm_runs_dir, oracle=oracle)
 
         script = (
@@ -1434,6 +1460,7 @@ class AblationBenchmarkRunner:
             tool_registry=_ArmToolRegistry(
                 wt,
                 enable_lineage_tool=arm.enable_lineage_tool,
+                skills_dir=DEFAULT_SKILLS_DIR if arm.enable_playbooks else None,
                 lineage_adapter=lineage,
                 duckdb_adapter=DuckDBAdapter(paths),
             ),
@@ -1483,6 +1510,7 @@ class AblationBenchmarkRunner:
                     tool_registry=_ArmToolRegistry(
                         wt,
                         enable_lineage_tool=arm.enable_lineage_tool,
+                        skills_dir=DEFAULT_SKILLS_DIR if arm.enable_playbooks else None,
                         lineage_adapter=lineage,
                         duckdb_adapter=DuckDBAdapter(paths),
                     ),
@@ -1498,18 +1526,19 @@ class AblationBenchmarkRunner:
                     static_system_prompt=build_static_system_prompt(),
                 )
                 service = PromotionService(arm_ws, arm_runs_dir)
-                awaiting_2 = service.reject(
+                service.reject(
                     run_id,
                     "Verify dim_user_ltv conservation alongside fct_daily_gmv.",
                     loop=resumed_loop,
                 )
-                states.append(awaiting_2)
                 service.approve(run_id)
                 final_state = CheckpointStore(arm_runs_dir, run_id).load_latest()
                 hitl_ok = final_state.status == "RESOLVED"
                 oracle_reasons: list[str] = [] if hitl_ok else ["Promotion did not reach RESOLVED."]
                 passed = hitl_ok
                 state = final_state
+                # `final_state` carries cumulative turns/usage for the single resumed Run.
+                states = [final_state]
             else:
                 hitl_ok = False
                 passed = False
@@ -1587,7 +1616,7 @@ class AblationBenchmarkRunner:
         arm: ArmConfig,
         arm_root: Path,
     ) -> ScenarioRunRecord:
-        arm_ws = _clone_git_workspace(injected_ws, arm_root / "workspace")
+        arm_ws = _clone_git_workspace(injected_ws, arm_root / "workspace", preserve_git=True)
         arm_runs_dir = arm_root / "runs"
         arm_runs_dir.mkdir(parents=True, exist_ok=True)
         local_outcome = base_outcome.model_copy(update={"workspace_dir": arm_ws})
