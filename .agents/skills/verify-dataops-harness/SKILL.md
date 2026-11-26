@@ -18,6 +18,15 @@ See [feature-map.md](feature-map.md) for user-POV commands, assertions, and dura
 6. 3-Arm Ablation Benchmark (`ablation_report.md`)
 7. Ephemeral `/tmp/dataops-verify-*` Cleanup & Evidence Survival (`verification_summary.md`)
 
+## Runtime Prerequisites
+
+- In non-interactive shells, prepend `$HOME/.local/bin` and `$HOME/.local/opt/jdk-17/bin` to `PATH` before invoking `uv`, `pytest`, or PySpark commands:
+  ```bash
+  export PATH="$HOME/.local/bin:$HOME/.local/opt/jdk-17/bin:$PATH"
+  ```
+- Execute PySpark and dbt test suites or ablation runs **sequentially** (never launch overlapping heavy JVM processes in parallel).
+- Use `grep` rather than `rg` when searching repository files in this shell environment.
+
 ## Run End-to-End Verification
 
 Run the default fast end-to-end verification suite (cross-category 3-scenario ablation + full HiTL CLI lifecycle + formal BFS/conformance checks) and inspect the durable proof directory:

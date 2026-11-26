@@ -1,6 +1,6 @@
 ---
 name: verify-run-state-machine
-description: Formally verify the DataOps-Harness Run lifecycle state machine, crash/resume checkpoints, bounded HiTL rejections, and Promotion safety invariants using exhaustive BFS model checking and live Python conformance checks. Use whenever modifying src/core/context.py, src/core/loop.py, src/core/promotion.py, or src/hooks/stop_gate.py.
+description: Formally verify the DataOps-Harness Run lifecycle state machine, crash/resume checkpoints, bounded HiTL rejections, and Promotion safety invariants using exhaustive BFS model checking and live Python conformance checks. Use whenever modifying src/core/context.py, src/core/loop.py, src/core/promotion.py, src/hooks/stop_gate.py, or src/hooks/compactor.py — and audit/update the spec and conformance checks when transition, rollback, or guard rules change (never rely solely on rerunning an un-updated script).
 ---
 
 # Verify Run State Machine & Promotion Invariants
