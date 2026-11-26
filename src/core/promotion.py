@@ -105,6 +105,16 @@ class PromotionService:
             backup_duckdb.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(prod_paths.prod_duckdb_path, backup_duckdb)
 
+        backup_silver_dir = self.runs_dir / run_id / ".prod_silver_backup"
+        silver_existed_before = prod_paths.prod_silver_dir.exists()
+        silver_backed_up = False
+
+        def _cleanup_backups() -> None:
+            if backup_duckdb.is_file():
+                backup_duckdb.unlink()
+            if backup_silver_dir.exists():
+                shutil.rmtree(backup_silver_dir)
+
         def _rollback_prod() -> None:
             subprocess.run(
                 ["git", "-C", str(self.prod_workspace), "reset", "--hard", pre_head],
@@ -115,6 +125,12 @@ class PromotionService:
             if backup_duckdb.is_file():
                 prod_paths.prod_duckdb_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(backup_duckdb, prod_paths.prod_duckdb_path)
+            if silver_backed_up:
+                if prod_paths.prod_silver_dir.exists():
+                    shutil.rmtree(prod_paths.prod_silver_dir)
+                if silver_existed_before and backup_silver_dir.is_dir():
+                    prod_paths.prod_silver_dir.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(backup_silver_dir, prod_paths.prod_silver_dir)
 
         normalized_diff = diff_text if diff_text.endswith("\n") else diff_text + "\n"
         check_proc = subprocess.run(
@@ -125,8 +141,7 @@ class PromotionService:
             check=False,
         )
         if check_proc.returncode != 0:
-            if backup_duckdb.is_file():
-                backup_duckdb.unlink()
+            _cleanup_backups()
             raise RuntimeError(
                 f"Production git apply --check failed: {check_proc.stderr.strip()}"
             )
@@ -191,6 +206,13 @@ class PromotionService:
 
             lineage = self.lineage_adapter or LineageAdapter.from_workspace(self.prod_workspace)
             affected = lineage.affected_downstream(changed_files)
+            if affected.spark_jobs:
+                if backup_silver_dir.exists():
+                    shutil.rmtree(backup_silver_dir)
+                if silver_existed_before:
+                    backup_silver_dir.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(prod_paths.prod_silver_dir, backup_silver_dir)
+                silver_backed_up = True
             events_dir = self.runs_dir / run_id / "prod_spark_events"
             spark_runner = self._custom_spark_runner or SparkJobRunner(event_log_dir=events_dir)
 
@@ -235,12 +257,10 @@ class PromotionService:
                 )
         except (RuntimeError, OSError, subprocess.SubprocessError):
             _rollback_prod()
-            if backup_duckdb.is_file():
-                backup_duckdb.unlink()
+            _cleanup_backups()
             raise
 
-        if backup_duckdb.is_file():
-            backup_duckdb.unlink()
+        _cleanup_backups()
 
         result = PromotionResult(
             run_id=run_id,

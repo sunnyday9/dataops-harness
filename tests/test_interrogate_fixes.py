@@ -18,13 +18,15 @@ from benchmarks.ablation_runner import (
     _clone_git_workspace,
 )
 from benchmarks.scenarios.base import InjectionOutcome
-from src.adapters.base import LakehousePaths
+from src.adapters.base import LakehousePaths, SparkRunResult
+from src.adapters.lineage_adapter import LineageAdapter
 from src.adapters.model_adapter import (
     FakeReplayModelAdapter,
     PricingConfig,
     ProviderConfig,
     TurnResponse,
 )
+from src.adapters.spark_adapter import SparkJobRunner
 from src.core.context import (
     CheckpointStore,
     IncidentInput,
@@ -502,6 +504,104 @@ def test_f8_promotion_approve_atomic_rollback(tmp_path: Path) -> None:
     RunWorktreeManager.cleanup(prod_ws, wt)
 
 
+def test_f8_promotion_approve_atomic_rollback_spark_silver(tmp_path: Path) -> None:
+    """F8: Failed Spark+dbt promotion rolls back prod_silver_dir in addition to git and DuckDB."""
+    prod_ws = tmp_path / "prod_sp"
+    runs_dir = tmp_path / "runs_sp"
+    orig_job = "def run():\n    return 1\n"
+    pre_head = _init_git_repo(
+        prod_ws,
+        {"spark_jobs/build_silver_orders.py": orig_job},
+        message="initial spark",
+    )
+
+    paths = LakehousePaths.from_workspace(prod_ws)
+    silver_orders_dir = paths.prod_silver_dir / "silver_orders"
+    silver_orders_dir.mkdir(parents=True, exist_ok=True)
+    orig_part = silver_orders_dir / "part-000.parquet"
+    orig_part.write_bytes(b"ORIG-SILVER-PARQUET")
+    paths.prod_mart_dir.mkdir(parents=True, exist_ok=True)
+    orig_db = b"ORIG-DUCKDB"
+    paths.prod_duckdb_path.write_bytes(orig_db)
+
+    run_id = "run-rb-spark-1"
+    wt = RunWorktreeManager.create(prod_ws, runs_dir, run_id)
+    (wt / "spark_jobs/build_silver_orders.py").write_text("def run():\n    return 2\n", encoding="utf-8")
+    diff_text = RunWorktreeManager.unified_diff(wt)
+    changed = ["spark_jobs/build_silver_orders.py"]
+
+    shadow_res = ShadowVerificationResult(
+        passed=True,
+        run_id=run_id,
+        worktree_path=str(wt),
+        shadow_silver_dir=str(runs_dir / run_id / "shadow" / "silver"),
+        shadow_duckdb_path=str(runs_dir / run_id / "shadow" / "mart" / "warehouse.duckdb"),
+        changed_files=changed,
+    )
+    packet = ApprovalPacket(
+        run_id=run_id,
+        incident_id="INC-RB-SP",
+        rca_report=RcaReport.model_validate_json(_valid_rca_json("INC-RB-SP", changed)),
+        unified_diff=diff_text,
+        shadow_verification=shadow_res,
+    )
+    state = RunState(
+        run_id=run_id,
+        incident=IncidentInput(incident_id="INC-RB-SP", title="Rollback SP", summary="Rollback SP"),
+        user_context=UserContext(role="de", resolution_mode="fix"),
+        status="AWAITING_APPROVAL",
+        metadata={"approval_packet": packet.model_dump(mode="json")},
+    )
+    CheckpointStore(runs_dir, run_id).append("run_completed", state)
+
+    class _MutatingSpark(SparkJobRunner):
+        def run_job(self, script_path, args=None, env_overrides=None):
+            arg_list = args or []
+            out_dir = Path(arg_list[arg_list.index("--output-dir") + 1])
+            target = out_dir / "silver_orders"
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "_mutated_during_promote").write_text("dirty", encoding="utf-8")
+            (target / "part-000.parquet").write_bytes(b"OVERWRITTEN-SILVER")
+            return SparkRunResult(
+                job_name=script_path.name,
+                script_path=script_path,
+                pid=0,
+                returncode=0,
+                duration_ms=1.0,
+                event_log_path=None,
+                stdout="ok",
+                stderr="",
+            )
+
+    def _failing_dbt(dbt_paths, silver_overrides, mart_duckdb_path, args):
+        mart_duckdb_path.write_bytes(b"CORRUPTED-DB")
+        return subprocess.CompletedProcess(["dbt", *args], 1, stdout="", stderr="dbt failed")
+
+    svc = PromotionService(
+        prod_ws,
+        runs_dir,
+        lineage_adapter=LineageAdapter.from_workspace(LIVE_WORKSPACE),
+        spark_runner=_MutatingSpark(event_log_dir=tmp_path / "ev"),
+        dbt_executor=_failing_dbt,
+    )
+    with pytest.raises(RuntimeError, match="Production post-commit verification failed"):
+        svc.approve(run_id)
+
+    cur_head = subprocess.run(
+        ["git", "-C", str(prod_ws), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert cur_head == pre_head
+    assert (prod_ws / "spark_jobs/build_silver_orders.py").read_text(encoding="utf-8") == orig_job
+    assert paths.prod_duckdb_path.read_bytes() == orig_db
+    assert orig_part.read_bytes() == b"ORIG-SILVER-PARQUET"
+    assert not (silver_orders_dir / "_mutated_during_promote").exists()
+    assert not (runs_dir / run_id / ".prod_silver_backup").exists()
+    RunWorktreeManager.cleanup(prod_ws, wt)
+
+
 def test_f9_integrity_oracle_blocks_neutralized_sql_and_yaml_tests(tmp_path: Path) -> None:
     """F9: DefaultIntegrityOracle rejects neutralized SQL tests and weakened schema YAML configs."""
     prod_ws = tmp_path / "prod"
@@ -673,7 +773,7 @@ def test_f11_loop_wire_integrity_crash_reconciliation_and_terminal_resume_guard(
     assert sent_msgs[3].tool_call_id == "c2"
 
     # Part C: Terminal states block resume(), except ABORTED_BUDGET with extra_turns > 0.
-    for idx, term_status in enumerate(["DIAGNOSED", "RESOLVED", "ABORTED_THRASH"]):
+    for idx, term_status in enumerate(["DIAGNOSED", "RESOLVED", "ABORTED_THRASH", "FAILED_ERROR"]):
         rid = f"run-term-{idx}"
         st = _make_state("de", run_id=rid)
         st.status = term_status  # type: ignore[assignment]

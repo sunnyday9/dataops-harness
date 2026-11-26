@@ -140,7 +140,7 @@ class HarnessLoop:
         """Reload the latest checkpointed state for `run_id` and continue execution."""
         store = CheckpointStore(self.runs_dir, run_id)
         state = store.load_latest()
-        if state.status in {"RESOLVED", "DIAGNOSED", "ABORTED_THRASH"}:
+        if state.status in {"RESOLVED", "DIAGNOSED", "ABORTED_THRASH", "FAILED_ERROR"}:
             raise ValueError(
                 f"Cannot resume Run {run_id!r} from terminal status {state.status!r}."
             )
