@@ -127,7 +127,52 @@ Observed results across all 14 scenarios using the deterministic `fake_replay` d
 | Group B (+Context & Lineage) | 66.7% (6/9) | 0.0% (0/13) | 4.64 | 111146 tok / $0.0000 (proj $0.2492) | 37.9% | alert_storm_amplification:1, cheat_or_test_bypass:2, hitl_lifecycle_incomplete:1, pii_leakage:1, safety_policy_bypass:2, thrash_budget_exhausted:1 |
 | Group C (Full DataOps-Harness) | 100.0% (9/9) | 100.0% (13/13) | 3.21 | 74204 tok / $0.0000 (proj $0.1786) | 34.7% | none (0 failures) |
 
-Pass `--provider anthropic_messages`, `openai_chat`, or `openai_responses` with API credentials configured in [models configuration](configs/models.yaml) to evaluate live LLM providers under identical scenario isolation and hidden regression oracles.
+### Filtering arms and saving traces
+
+Pass `--scenarios`, `--arms`, and `--trace-dir` to run a targeted subset and inspect turn-by-turn tool calls:
+
+```bash
+uv run python -m benchmarks.ablation_runner \
+	--provider fake_replay \
+	--scenarios dbt_broken_macro_git \
+	--arms group_b group_c \
+	--max-turns 20 \
+	--trace-dir /tmp/ablation-traces \
+	--output /tmp/ablation_subset.md \
+	--json-output /tmp/ablation_subset.json
+```
+
+- `--arms` accepts any subset of `group_a`, `group_b`, and `group_c`, and defaults to all three arms.
+- `--trace-dir` saves per-run `checkpoint.jsonl` logs under `<trace_dir>/<scenario_id>/<arm_id>/<run_id>/checkpoint.jsonl`.
+- The Markdown report appends a `## Tool Call Traces` section with compact per-turn tool steps, and the JSON report includes `tool_trace` and `trace_paths` on each scenario record.
+
+### Model providers
+
+Configure credentials for any provider defined in [models configuration](configs/models.yaml) and pass its key to `--provider`. All live providers run under identical scenario isolation and hidden regression oracles.
+
+| Provider key | Protocol | Model | API key env | Base URL override env | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `fake_replay` | `fake_replay` | `fake-replay-v1` | None | None | Default deterministic zero-token driver |
+| `anthropic_messages` | `anthropic_messages` | `claude-sonnet-4-20250514` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` | Ephemeral prompt caching |
+| `openai_chat` | `openai_chat` | `gpt-4o` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | Automatic prefix caching |
+| `openai_responses` | `openai_responses` | `gpt-4.1` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | Stateless (`store: false`) |
+| `gemini_free` | `openai_chat` | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` | `GEMINI_BASE_URL` | Free tier, retries `429` and `5xx` up to 4 times, preserves Gemini 3.5 `thought_signature` on tool calls |
+| `openrouter_free` | `openai_chat` | `nvidia/nemotron-3-ultra-550b-a55b:free` | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL` | Free tier via OpenRouter (`X-Title: DataOps-Harness`), subject to daily free request limits |
+| `openrouter_free_router` | `openai_chat` | `openrouter/free` | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL` | OpenRouter automatic free-model router, subject to daily free request limits |
+| `opencode_free` | `openai_chat` | `deepseek-v4.1-flash-free` | `OPENCODE_API_KEY` | `OPENCODE_BASE_URL` | Free tier via OpenCode Zen, subject to free usage quota limits |
+
+Run a live free-tier evaluation with `gemini_free` after exporting `GEMINI_API_KEY`:
+
+```bash
+export GEMINI_API_KEY="<your-key>"
+uv run python -m benchmarks.ablation_runner \
+	--provider gemini_free \
+	--scenarios dbt_broken_macro_git \
+	--arms group_c \
+	--max-turns 12 \
+	--trace-dir /tmp/gemini-traces \
+	--output /tmp/gemini_report.md
+```
 
 ## Repository layout
 
