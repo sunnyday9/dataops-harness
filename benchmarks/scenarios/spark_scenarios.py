@@ -159,7 +159,7 @@ class SparkJoinSkewScenario(FaultScenario):
         paths = LakehousePaths.from_workspace(workspace_dir)
         baseline_mart = read_mart_metrics(paths.prod_duckdb_path)
 
-        # Spread 10,500 hot-key (`U0001`) orders evenly across all 7 raw date partitions.
+        # Spread 28,000 hot-key (`U0001`) orders evenly across all 7 raw date partitions.
         day_dirs = sorted(
             p for p in (paths.raw_dir / "orders").iterdir() if p.is_dir() and p.name.startswith("dt=")
         )
@@ -168,7 +168,7 @@ class SparkJoinSkewScenario(FaultScenario):
             day_str = day_dir.name.removeprefix("dt=")
             orders_file = day_dir / "orders.json"
             with orders_file.open("a", encoding="utf-8") as handle:
-                for i in range(1500):
+                for i in range(4000):
                     added_orders += 1
                     rec = {
                         "order_id": f"ORD-SKEW-{d_idx}-{i:04d}",
@@ -193,9 +193,14 @@ class SparkJoinSkewScenario(FaultScenario):
             orders_raw.join(users_country, on="user_id", how="left")
             .withColumn(
                 "_skew_digest",
-                F.sha2(
-                    F.concat_ws("|", F.col("order_id"), F.repeat(F.coalesce(F.col("user_country"), F.lit("UNKNOWN")), 25)),
-                    256,
+                F.aggregate(
+                    F.sequence(F.lit(1), F.lit(450)),
+                    F.concat_ws(
+                        "|",
+                        F.col("order_id"),
+                        F.coalesce(F.col("user_country"), F.lit("UNKNOWN")),
+                    ),
+                    lambda acc, _: F.sha2(acc, 256),
                 ),
             )
             .filter(F.length(F.col("_skew_digest")) == 64)

@@ -38,6 +38,7 @@ def build_spark_session(
             "org.apache.spark.sql.delta.catalog.DeltaCatalog",
         )
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        .config("spark.databricks.delta.snapshotPartitions", "2")
     )
     extra_java_opts = os.environ.get("SPARK_DRIVER_EXTRA_JAVA_OPTIONS")
     if extra_java_opts:
