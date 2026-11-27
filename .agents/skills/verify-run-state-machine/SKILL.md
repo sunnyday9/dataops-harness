@@ -7,7 +7,7 @@ description: Formally verify the DataOps-Harness Run lifecycle state machine, cr
 
 Formally verify that no `Run` can mutate production git/lakehouse storage without green `ShadowOverlayVerifier` verification and explicit HiTL approval, crash/resume preserves budget and turn counters, and HiTL rejections remain strictly bounded.
 
-**Last Verified Sync Commit**: `59eb65e`
+**Last Verified Sync Commit**: `0ba2fb4`
 
 ## What This Skill Covers
 
