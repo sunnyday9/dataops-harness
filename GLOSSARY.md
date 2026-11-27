@@ -29,7 +29,7 @@ The exit contract governing a Run: either Fix Mode (requiring verified remediati
 _Avoid_: run mode, execution mode
 
 **Promotion**:
-The human-approved transition of a verified remediation from the isolated shadow area into production code and production data.
+The human-approved delivery of a verified remediation from an isolated shadow area, either by opening a pull request against a target repository or by replaying it in a local sandbox.
 _Avoid_: deploy, merge, apply
 
 **Fault Scenario**:
@@ -44,6 +44,10 @@ _Avoid_: user type, profile, persona
 A read-through data view used during shadow verification in which patched upstream tables resolve from a Run's isolated shadow storage while unmodified tables fall back to read-only production storage.
 _Avoid_: staging, sandbox copy
 
+**Shadow Backend**:
+A pluggable isolation strategy that prepares, executes, diffs, and tears down a Shadow Overlay against a specific storage or compute engine.
+_Avoid_: shadow runner, test env, staging adapter
+
 **Hidden Regression Oracle**:
 An out-of-workspace verification specification that asserts test integrity, metric conservation, and root-cause-layer invariants against shadow outputs without being visible to the agent.
 _Avoid_: test suite, evaluator script
@@ -55,4 +59,8 @@ _Avoid_: static mask, hash, anonymized value
 **RCA Report**:
 The structured root-cause diagnosis artifact—citing root-cause layer, affected assets, concrete evidence, and proposed remediation—required before a Run can complete or request approval.
 _Avoid_: summary, diagnosis text, final output
+
+**Project Manifest**:
+A minimal declarative file in a target repository that specifies its Shadow Backend, connection environment variables, and governance policy overrides, supplementing metadata discovered from OpenLineage and dbt artifacts.
+_Avoid_: config file, harness config, repo spec
 
