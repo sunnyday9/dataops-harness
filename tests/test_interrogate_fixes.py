@@ -684,6 +684,68 @@ def test_f10_real_spark_describe_history(tmp_path: Path) -> None:
     assert len(payload["rows"]) >= 1
 
 
+def test_f10_real_spark_sql_triggers_layer1_pii_redaction(tmp_path: Path) -> None:
+    """Real Spark SQL stdout JSON triggers PiiRedactorHook Layer-1 masking on PII fields."""
+    ws = tmp_path / "ws"
+    shutil.copytree(
+        LIVE_WORKSPACE,
+        ws,
+        ignore=shutil.ignore_patterns(".git", ".scratch", "logs", ".user.yml", "__pycache__"),
+    )
+    call = ToolCall(
+        id="sp-pii",
+        name="run_sql_readonly",
+        arguments={
+            "sql": "SELECT user_id, email, phone, national_id FROM silver_users LIMIT 3",
+            "engine": "spark",
+        },
+    )
+    res = ToolRegistry(ws).execute(call)
+    assert res.is_error is False, res.output
+    assert res.output.lstrip().startswith("{"), (
+        f"Expected structured JSON output, got: {res.output[:120]}"
+    )
+
+    raw_payload = json.loads(res.output)
+    cols = raw_payload["columns"]
+    assert {"user_id", "email", "phone", "national_id"}.issubset(set(cols))
+    assert len(raw_payload["rows"]) == 3
+
+    def _cell(row: object, col_names: list[str], name: str) -> str:
+        val = (
+            row.get(name, "")
+            if isinstance(row, dict)
+            else row[col_names.index(name)]  # type: ignore[index]
+        )
+        return "" if val is None else str(val)
+
+    raw_emails = [v for r in raw_payload["rows"] if (v := _cell(r, cols, "email"))]
+    raw_phones = [v for r in raw_payload["rows"] if (v := _cell(r, cols, "phone"))]
+    raw_ids = [v for r in raw_payload["rows"] if (v := _cell(r, cols, "national_id"))]
+    assert raw_emails and raw_phones and raw_ids
+
+    redactor = PiiRedactorHook(policies=load_policies())
+    state = _make_state("de", run_id="run-f10-spark-pii")
+    structured = redactor._redact_structured_sql_json(state, res.output)
+    assert structured is not None
+
+    dec = redactor.on_post_tool_use(state, call, res)
+    assert dec.action == "modify"
+    assert dec.modified_output is not None
+
+    for sensitive in raw_emails + raw_phones + raw_ids:
+        assert sensitive not in dec.modified_output
+
+    redacted_payload = json.loads(dec.modified_output)
+    redacted_cols = redacted_payload["columns"]
+    assert len(redacted_payload["rows"]) == 3
+
+    for row in redacted_payload["rows"]:
+        assert re.fullmatch(r"<EMAIL_[0-9a-f]{8}>", _cell(row, redacted_cols, "email"))
+        assert re.fullmatch(r"<PHONE_[0-9a-f]{8}>", _cell(row, redacted_cols, "phone"))
+        assert re.fullmatch(r"<ID_[0-9a-f]{8}>", _cell(row, redacted_cols, "national_id"))
+
+
 def test_f11_loop_wire_integrity_crash_reconciliation_and_terminal_resume_guard(
     tmp_path: Path,
 ) -> None:

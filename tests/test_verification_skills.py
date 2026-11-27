@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -49,11 +50,58 @@ def test_project_skills_frontmatter_zero_placeholders_and_runtime_playbooks_inta
         "src/core/context.py",
         "src/core/loop.py",
         "src/hooks/stop_gate.py",
+        "src/hooks/compactor.py",
         "src/core/promotion.py",
         "configs/policies.yaml",
     ):
         assert expected_path in formal_md
         assert (REPO_ROOT / expected_path).is_file()
+
+
+def test_formal_verification_sync_commit_not_stale() -> None:
+    """Formal verification baseline commit must cover all recent state-machine edits."""
+    formal_md = (SKILLS_ROOT / "verify-run-state-machine" / "SKILL.md").read_text(encoding="utf-8")
+    match = re.search(r"\*\*Last Verified Sync Commit\*\*:\s*`([0-9a-f]{7,40})`", formal_md)
+    assert match is not None, (
+        "Missing '**Last Verified Sync Commit**: `<sha>`' marker in "
+        ".agents/skills/verify-run-state-machine/SKILL.md"
+    )
+    sync_sha = match.group(1)
+
+    rev = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "--verify", f"{sync_sha}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rev.returncode == 0, f"Sync commit {sync_sha!r} is unreachable: {rev.stderr.strip()}"
+
+    diff_log = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "log",
+            f"{sync_sha}..HEAD",
+            "--oneline",
+            "--",
+            "src/core/context.py",
+            "src/core/loop.py",
+            "src/core/promotion.py",
+            "src/hooks/stop_gate.py",
+            "src/hooks/compactor.py",
+            "configs/policies.yaml",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert diff_log.returncode == 0, diff_log.stderr.strip()
+    assert diff_log.stdout.strip() == "", (
+        "Covered state-machine/policy files changed after verify-run-state-machine "
+        f"sync commit {sync_sha}. Run /maintain-formal-verification-skill and update "
+        f"'Last Verified Sync Commit':\n{diff_log.stdout.strip()}"
+    )
 
 
 def test_formal_state_machine_skill_passes_bfs_negative_control_and_conformance(
