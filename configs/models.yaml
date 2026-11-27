@@ -60,3 +60,73 @@ providers:
       input: 0.0
       cached_input: 0.0
       output: 0.0
+
+  openrouter_free:
+    api_protocol: openai_chat
+    model: nvidia/nemotron-3-ultra-550b-a55b:free
+    api_key_env: OPENROUTER_API_KEY
+    base_url: https://openrouter.ai/api/v1
+    base_url_env: OPENROUTER_BASE_URL
+    extra_headers:
+      X-Title: DataOps-Harness
+    max_tokens: 4096
+    temperature: 0.0
+    prompt_caching:
+      enabled: true
+      automatic_prefix_caching: true
+    pricing_per_1m_tokens:
+      input: 0.0
+      cached_input: 0.0
+      output: 0.0
+
+  openrouter_free_router:
+    api_protocol: openai_chat
+    model: openrouter/free
+    api_key_env: OPENROUTER_API_KEY
+    base_url: https://openrouter.ai/api/v1
+    base_url_env: OPENROUTER_BASE_URL
+    extra_headers:
+      X-Title: DataOps-Harness
+    max_tokens: 4096
+    temperature: 0.0
+    prompt_caching:
+      enabled: true
+      automatic_prefix_caching: true
+    pricing_per_1m_tokens:
+      input: 0.0
+      cached_input: 0.0
+      output: 0.0
+
+  opencode_free:
+    api_protocol: openai_chat
+    model: deepseek-v4.1-flash-free
+    api_key_env: OPENCODE_API_KEY
+    base_url: https://opencode.ai/zen/v1
+    base_url_env: OPENCODE_BASE_URL
+    max_tokens: 4096
+    temperature: 0.0
+    prompt_caching:
+      enabled: true
+      automatic_prefix_caching: true
+    pricing_per_1m_tokens:
+      input: 0.0
+      cached_input: 0.0
+      output: 0.0
+
+  gemini_free:
+    api_protocol: openai_chat
+    model: gemini-3.5-flash-lite
+    api_key_env: GEMINI_API_KEY
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    base_url_env: GEMINI_BASE_URL
+    max_tokens: 4096
+    temperature: 0.0
+    max_retries: 4
+    request_timeout_seconds: 90.0
+    prompt_caching:
+      enabled: true
+      automatic_prefix_caching: true
+    pricing_per_1m_tokens:
+      input: 0.0
+      cached_input: 0.0
+      output: 0.0

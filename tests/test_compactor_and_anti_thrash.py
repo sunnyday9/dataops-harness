@@ -395,6 +395,39 @@ def test_anti_thrash_healthy_varied_investigation_no_false_positives() -> None:
     assert state.metadata[ANTI_THRASH_METADATA_KEY]["strikes"] == 0
 
 
+def test_anti_thrash_allows_reread_after_failed_apply_patch() -> None:
+    """Re-reading a target file after a failed (non-blocked) apply_patch resets its read signature."""
+    hook = AntiThrashHook(policy=AntiThrashPolicy())
+    state = _make_state()
+
+    read_tc = ToolCall(id="r1", name="read_file", arguments={"path": "dbt_project/m.sql"})
+    read_ok = ToolResult(tool_call_id="r1", name="read_file", output="SELECT 1")
+    assert hook.on_post_tool_use(state, read_tc, read_ok).abort_status is None
+
+    failed_patch_tc = ToolCall(
+        id="p1",
+        name="apply_patch",
+        arguments={
+            "patch": "--- dbt_project/m.sql\n+++ dbt_project/m.sql\n@@ -1 +1 @@\n-bad\n+good\n"
+        },
+    )
+    failed_patch_res = ToolResult(
+        tool_call_id="p1",
+        name="apply_patch",
+        output="git apply --check failed",
+        is_error=True,
+        blocked=False,
+    )
+    patch_dec = hook.on_post_tool_use(state, failed_patch_tc, failed_patch_res)
+    assert patch_dec.abort_status is None and not patch_dec.injected_messages
+
+    reread_tc = ToolCall(id="r2", name="read_file", arguments={"path": "dbt_project/m.sql"})
+    reread_dec = hook.on_post_tool_use(state, reread_tc, read_ok)
+    assert reread_dec.abort_status is None
+    assert not reread_dec.injected_messages
+    assert state.metadata[ANTI_THRASH_METADATA_KEY]["strikes"] == 0
+
+
 def test_e2e_harness_loop_compactor_spill_prefix_cache_and_wire_adapters(
     tmp_path: Path,
 ) -> None:

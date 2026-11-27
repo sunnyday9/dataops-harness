@@ -150,6 +150,16 @@ ARM_CONFIGS: dict[ArmId, ArmConfig] = {
 }
 
 
+class ToolTraceStep(BaseModel):
+    """Compact per-tool execution event extracted from a Run checkpoint log."""
+
+    turn: int
+    tool: str
+    blocked: bool = False
+    is_error: bool = False
+    run_id: str = ""
+
+
 class ScenarioRunRecord(BaseModel):
     """Normalized execution and external-oracle evaluation record for one (arm, scenario)."""
 
@@ -174,6 +184,8 @@ class ScenarioRunRecord(BaseModel):
     failure_attribution: FailureCategory = "none"
     details: str = ""
     oracle_reasons: list[str] = Field(default_factory=list)
+    tool_trace: list[ToolTraceStep] = Field(default_factory=list)
+    trace_paths: list[str] = Field(default_factory=list)
 
 
 class ArmSummary(BaseModel):
@@ -803,6 +815,41 @@ def _pii_leaked_in_requests(adapter: ModelAdapter) -> bool:
     return bool(_EMAIL_LEAK_RE.search(serialized) or "NID-" in serialized)
 
 
+def _collect_tool_traces(
+    arm_runs_dir: Path,
+    run_ids: list[str],
+    *,
+    trace_dir: Path | None,
+    scenario_id: str,
+    arm_id: ArmId,
+) -> tuple[list[ToolTraceStep], list[str]]:
+    """Extract compact per-turn tool steps and optionally persist checkpoint logs."""
+    steps: list[ToolTraceStep] = []
+    trace_paths: list[str] = []
+    for run_id in dict.fromkeys(run_ids):
+        store = CheckpointStore(arm_runs_dir, run_id)
+        for event in store.read_events():
+            if event.get("event_type") != "tool_step":
+                continue
+            detail = event.get("detail") or {}
+            state_obj = event.get("state") or {}
+            steps.append(
+                ToolTraceStep(
+                    turn=int(state_obj.get("turn") or 0),
+                    tool=str(detail.get("tool") or ""),
+                    blocked=bool(detail.get("blocked")),
+                    is_error=bool(detail.get("is_error")),
+                    run_id=run_id,
+                )
+            )
+        if trace_dir is not None and store.state_path.is_file():
+            dest = trace_dir.resolve() / scenario_id / arm_id / run_id / "checkpoint.jsonl"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(store.state_path, dest)
+            trace_paths.append(str(dest))
+    return steps, trace_paths
+
+
 class AblationBenchmarkRunner:
     """Execute all 14 Fault Scenarios across Group A, B, and C with external oracle & safety checks."""
 
@@ -815,6 +862,7 @@ class AblationBenchmarkRunner:
         max_turns: int = 20,
         workspace_template_dir: Path | None = None,
         model_factory: Callable[[ArmConfig, InjectionOutcome], ModelAdapter] | None = None,
+        trace_dir: Path | None = None,
     ) -> None:
         self.provider = provider
         self.models_config_path = models_config_path
@@ -822,6 +870,7 @@ class AblationBenchmarkRunner:
         self.max_turns = max_turns
         self.source_workspace = (workspace_template_dir or LIVE_WORKSPACE).resolve()
         self.model_factory = model_factory
+        self.trace_dir = trace_dir.resolve() if trace_dir is not None else None
 
     def _evaluate_security_scenario(
         self,
@@ -1181,6 +1230,13 @@ class AblationBenchmarkRunner:
         in_t, cache_t, out_t, cost, proj_cost, hit_rate = _aggregate_usage(
             all_states, pricing
         )
+        tool_trace, trace_paths = _collect_tool_traces(
+            arm_runs_dir,
+            [s.run_id for s in all_states],
+            trace_dir=self.trace_dir,
+            scenario_id=sid,
+            arm_id=arm.arm_id,
+        )
         return ScenarioRunRecord(
             arm_id=arm.arm_id,
             scenario_id=sid,
@@ -1203,6 +1259,8 @@ class AblationBenchmarkRunner:
             failure_attribution=failure_cat,
             details=f"intercepted {intercepted}/{total_probes} probes; pii_leaked={pii_leaked}",
             oracle_reasons=verdict.reasons,
+            tool_trace=tool_trace,
+            trace_paths=trace_paths,
         )
 
     def _evaluate_alert_storm_scenario(
@@ -1325,6 +1383,13 @@ class AblationBenchmarkRunner:
         in_t, cache_t, out_t, cost, proj_cost, hit_rate = _aggregate_usage(
             states, pricing
         )
+        tool_trace, trace_paths = _collect_tool_traces(
+            arm_runs_dir,
+            [s.run_id for s in states],
+            trace_dir=self.trace_dir,
+            scenario_id=scenario.scenario_id,
+            arm_id=arm.arm_id,
+        )
         return ScenarioRunRecord(
             arm_id=arm.arm_id,
             scenario_id=scenario.scenario_id,
@@ -1345,6 +1410,8 @@ class AblationBenchmarkRunner:
             details=(
                 f"converged {len(base_outcome.raw_alerts)} alerts into {len(states)} Run(s)"
             ),
+            tool_trace=tool_trace,
+            trace_paths=trace_paths,
         )
 
     def _evaluate_thrash_scenario(
@@ -1403,6 +1470,13 @@ class AblationBenchmarkRunner:
         in_t, cache_t, out_t, cost, proj_cost, hit_rate = _aggregate_usage(
             [state], adapter.config.pricing_per_1m_tokens
         )
+        tool_trace, trace_paths = _collect_tool_traces(
+            arm_runs_dir,
+            [state.run_id],
+            trace_dir=self.trace_dir,
+            scenario_id=scenario.scenario_id,
+            arm_id=arm.arm_id,
+        )
         return ScenarioRunRecord(
             arm_id=arm.arm_id,
             scenario_id=scenario.scenario_id,
@@ -1421,6 +1495,8 @@ class AblationBenchmarkRunner:
             prompt_cache_hit_rate=hit_rate,
             failure_attribution="none" if early_abort else "thrash_budget_exhausted",
             details=f"terminated with status={state.status} at turn {state.turn}/{arm.max_turns}",
+            tool_trace=tool_trace,
+            trace_paths=trace_paths,
         )
 
     def _evaluate_fix_scenario(
@@ -1587,6 +1663,13 @@ class AblationBenchmarkRunner:
         in_t, cache_t, out_t, cost, proj_cost, hit_rate = _aggregate_usage(
             states, adapter.config.pricing_per_1m_tokens
         )
+        tool_trace, trace_paths = _collect_tool_traces(
+            arm_runs_dir,
+            [s.run_id for s in states],
+            trace_dir=self.trace_dir,
+            scenario_id=sid,
+            arm_id=arm.arm_id,
+        )
         return ScenarioRunRecord(
             arm_id=arm.arm_id,
             scenario_id=sid,
@@ -1606,6 +1689,8 @@ class AblationBenchmarkRunner:
             failure_attribution=failure_cat,
             details="; ".join(oracle_reasons[:2]) if oracle_reasons else "External oracle passed.",
             oracle_reasons=oracle_reasons,
+            tool_trace=tool_trace,
+            trace_paths=trace_paths,
         )
 
     def _run_scenario_for_arm(
@@ -1742,6 +1827,16 @@ def _format_failure_attribution(counts: dict[str, int]) -> str:
     return ", ".join(f"{key}:{val}" for key, val in counts.items())
 
 
+def _format_tool_trace(steps: list[ToolTraceStep]) -> str:
+    if not steps:
+        return "none"
+    tokens: list[str] = []
+    for step in steps:
+        suffix = "[blocked]" if step.blocked else ("[error]" if step.is_error else "")
+        tokens.append(f"t{step.turn}:{step.tool}{suffix}")
+    return " -> ".join(tokens)
+
+
 def render_markdown_report(report: AblationReport) -> str:
     """Render a structured Markdown ablation comparison report from `AblationReport`."""
     lines: list[str] = [
@@ -1814,6 +1909,17 @@ def render_markdown_report(report: AblationReport) -> str:
                 cells.append(f"{badge} [{rec.turns}t]")
         lines.append(f"| `{sid}` | `{category}` | {cells[0]} | {cells[1]} | {cells[2]} |")
 
+    lines.extend(["", "## Tool Call Traces", ""])
+    for sid in report.scenario_ids:
+        for arm in report.arms:
+            rec = by_arm_scenario.get((arm.arm_id, sid))
+            if rec is None:
+                continue
+            lines.append(
+                f"- `{sid}` / `{arm.arm_id}` (`{rec.final_status}`): "
+                f"{_format_tool_trace(rec.tool_trace)}"
+            )
+
     lines.append("")
     return "\n".join(lines)
 
@@ -1841,6 +1947,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional subset of scenario_ids (defaults to all 14 scenarios).",
     )
     parser.add_argument(
+        "--arms",
+        nargs="*",
+        choices=list(DEFAULT_ARM_ORDER),
+        default=None,
+        help="Optional subset of arms to evaluate (defaults to group_a group_b group_c).",
+    )
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to persist per-(scenario, arm, run) checkpoint.jsonl logs.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -1857,8 +1976,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    runner = AblationBenchmarkRunner(provider=args.provider, max_turns=args.max_turns)
-    report = runner.run(scenario_ids=args.scenarios or None)
+    runner = AblationBenchmarkRunner(
+        provider=args.provider,
+        max_turns=args.max_turns,
+        trace_dir=args.trace_dir,
+    )
+    selected_arms = tuple(dict.fromkeys(args.arms)) if args.arms else DEFAULT_ARM_ORDER
+    report = runner.run(scenario_ids=args.scenarios or None, arms=selected_arms)
     markdown = render_markdown_report(report)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

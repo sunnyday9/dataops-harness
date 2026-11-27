@@ -52,6 +52,7 @@ class ToolCall(BaseModel):
     id: str
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    extra_content: dict[str, Any] | None = None
 
 
 class ToolResult(BaseModel):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -35,10 +36,14 @@ class ProviderConfig(BaseModel):
     api_protocol: ApiProtocol
     model: str
     api_key_env: str | None = None
+    base_url: str | None = None
     base_url_env: str | None = None
+    extra_headers: dict[str, str] = Field(default_factory=dict)
     store: bool = False
     max_tokens: int = 4096
     temperature: float = 0.0
+    max_retries: int = 3
+    request_timeout_seconds: float = 120.0
     prompt_caching: dict[str, Any] = Field(default_factory=dict)
     pricing_per_1m_tokens: PricingConfig = Field(default_factory=PricingConfig)
 
@@ -108,9 +113,61 @@ class ModelAdapter(ABC):
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
 
+    def _resolve_api_key(self, *, required: bool = False) -> str | None:
+        if not self.config.api_key_env:
+            return None
+        api_key = os.environ.get(self.config.api_key_env, "").strip()
+        if required and not api_key:
+            raise ValueError(
+                f"Missing required API key environment variable: {self.config.api_key_env}"
+            )
+        return api_key or None
+
+    def _resolve_base_url(self) -> str | None:
+        env_url = (
+            os.environ.get(self.config.base_url_env, "").strip()
+            if self.config.base_url_env
+            else ""
+        )
+        return env_url or self.config.base_url
+
     @abstractmethod
     def complete(self, request: TurnRequest) -> TurnResponse:
         """Send a stateless turn request and return normalized output and usage."""
+
+
+def _retry_delay_seconds(exc: Exception, attempt: int) -> float | None:
+    """Return bounded exponential backoff seconds for transient HTTP/network failures."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    cls_name = type(exc).__name__
+    is_transient = (
+        status_code in {429, 500, 502, 503, 504}
+        or isinstance(exc, TimeoutError)
+        or "Timeout" in cls_name
+        or "Connection" in cls_name
+    )
+    if not is_transient:
+        return None
+
+    delay = float(3 * (2**attempt))
+    headers = getattr(response, "headers", None) if response is not None else None
+    if headers:
+        retry_after = None
+        for key, val in headers.items():
+            if str(key).lower() == "retry-after":
+                retry_after = val
+                break
+        if retry_after is not None:
+            try:
+                parsed = float(retry_after)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None and parsed >= 0:
+                delay = parsed
+    return min(delay, 30.0)
 
 
 class AnthropicMessagesAdapter(ModelAdapter):
@@ -119,21 +176,14 @@ class AnthropicMessagesAdapter(ModelAdapter):
     def __init__(self, config: ProviderConfig, client: Any = None) -> None:
         super().__init__(config)
         self._client = client
+        self.recorded_requests: list[TurnRequest] = []
 
     def _get_client(self) -> Any:
         if self._client is None:
             import anthropic
 
-            api_key = (
-                os.environ.get(self.config.api_key_env)
-                if self.config.api_key_env
-                else None
-            )
-            base_url = (
-                os.environ.get(self.config.base_url_env)
-                if self.config.base_url_env
-                else None
-            )
+            api_key = self._resolve_api_key()
+            base_url = self._resolve_base_url()
             self._client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
         return self._client
 
@@ -273,6 +323,7 @@ class AnthropicMessagesAdapter(ModelAdapter):
         )
 
     def complete(self, request: TurnRequest) -> TurnResponse:
+        self.recorded_requests.append(request.model_copy(deep=True))
         payload = self.build_payload(request)
         resp = self._get_client().messages.create(**payload)
         raw = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
@@ -285,22 +336,20 @@ class OpenAIChatAdapter(ModelAdapter):
     def __init__(self, config: ProviderConfig, client: Any = None) -> None:
         super().__init__(config)
         self._client = client
+        self.recorded_requests: list[TurnRequest] = []
 
     def _get_client(self) -> Any:
         if self._client is None:
             import openai
 
-            api_key = (
-                os.environ.get(self.config.api_key_env)
-                if self.config.api_key_env
-                else None
+            api_key = self._resolve_api_key(required=True)
+            base_url = self._resolve_base_url()
+            self._client = openai.OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                default_headers=self.config.extra_headers or None,
+                timeout=self.config.request_timeout_seconds,
             )
-            base_url = (
-                os.environ.get(self.config.base_url_env)
-                if self.config.base_url_env
-                else None
-            )
-            self._client = openai.OpenAI(api_key=api_key, base_url=base_url)
         return self._client
 
     def build_payload(self, request: TurnRequest) -> dict[str, Any]:
@@ -318,7 +367,7 @@ class OpenAIChatAdapter(ModelAdapter):
             elif msg.role == "assistant":
                 entry: dict[str, Any] = {
                     "role": "assistant",
-                    "content": msg.content or None,
+                    "content": msg.content or "",
                 }
                 if msg.tool_calls:
                     entry["tool_calls"] = [
@@ -331,6 +380,11 @@ class OpenAIChatAdapter(ModelAdapter):
                                     tc.arguments, ensure_ascii=False
                                 ),
                             },
+                            **(
+                                {"extra_content": tc.extra_content}
+                                if tc.extra_content is not None
+                                else {}
+                            ),
                         }
                         for tc in msg.tool_calls
                     ]
@@ -369,17 +423,32 @@ class OpenAIChatAdapter(ModelAdapter):
         choice = choices[0]
         message = choice.get("message") or {}
         tool_calls: list[ToolCall] = []
-        for raw_tc in message.get("tool_calls") or []:
+        for idx, raw_tc in enumerate(message.get("tool_calls") or []):
             fn = raw_tc.get("function") or {}
-            raw_args = fn.get("arguments") or "{}"
-            parsed_args = (
-                json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-            )
+            raw_args = fn.get("arguments")
+            if isinstance(raw_args, dict):
+                parsed_args = dict(raw_args)
+            elif isinstance(raw_args, str) and raw_args.strip():
+                try:
+                    loaded = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    parsed_args = {"_raw_arguments": raw_args}
+                else:
+                    parsed_args = (
+                        loaded
+                        if isinstance(loaded, dict)
+                        else {"_raw_arguments": raw_args}
+                    )
+            else:
+                parsed_args = {}
+            tc_id = str(raw_tc.get("id") or "").strip() or f"tc-{idx}"
+            raw_extra = raw_tc.get("extra_content")
             tool_calls.append(
                 ToolCall(
-                    id=str(raw_tc.get("id") or ""),
+                    id=tc_id,
                     name=str(fn.get("name") or ""),
                     arguments=parsed_args,
+                    extra_content=dict(raw_extra) if isinstance(raw_extra, dict) else None,
                 )
             )
 
@@ -410,8 +479,19 @@ class OpenAIChatAdapter(ModelAdapter):
         )
 
     def complete(self, request: TurnRequest) -> TurnResponse:
+        self.recorded_requests.append(request.model_copy(deep=True))
         payload = self.build_payload(request)
-        resp = self._get_client().chat.completions.create(**payload)
+        client = self._get_client()
+        max_retries = max(int(self.config.max_retries), 0)
+        for attempt in range(max_retries + 1):
+            try:
+                resp = client.chat.completions.create(**payload)
+                break
+            except Exception as exc:
+                delay = _retry_delay_seconds(exc, attempt)
+                if delay is None or attempt >= max_retries:
+                    raise
+                time.sleep(delay)
         raw = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
         return self.parse_response(raw)
 
@@ -422,21 +502,14 @@ class OpenAIResponsesAdapter(ModelAdapter):
     def __init__(self, config: ProviderConfig, client: Any = None) -> None:
         super().__init__(config)
         self._client = client
+        self.recorded_requests: list[TurnRequest] = []
 
     def _get_client(self) -> Any:
         if self._client is None:
             import openai
 
-            api_key = (
-                os.environ.get(self.config.api_key_env)
-                if self.config.api_key_env
-                else None
-            )
-            base_url = (
-                os.environ.get(self.config.base_url_env)
-                if self.config.base_url_env
-                else None
-            )
+            api_key = self._resolve_api_key()
+            base_url = self._resolve_base_url()
             self._client = openai.OpenAI(api_key=api_key, base_url=base_url)
         return self._client
 
@@ -555,6 +628,7 @@ class OpenAIResponsesAdapter(ModelAdapter):
         )
 
     def complete(self, request: TurnRequest) -> TurnResponse:
+        self.recorded_requests.append(request.model_copy(deep=True))
         payload = self.build_payload(request)
         resp = self._get_client().responses.create(**payload)
         raw = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)

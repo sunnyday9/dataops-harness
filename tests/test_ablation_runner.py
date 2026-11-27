@@ -138,3 +138,48 @@ def test_ablation_report_renderer_standalone(tmp_path: Path) -> None:
     rendered = render_markdown_report(report)
     assert "ops_alert_storm_convergence" in rendered
     assert "alert_storm_amplification" in rendered
+
+
+def test_ablation_trace_dir_and_arms_subset(tmp_path: Path) -> None:
+    """CLI supports --arms filtering, --trace-dir checkpoint retention, and tool traces."""
+    trace_dir = tmp_path / "traces"
+    md_out = tmp_path / "subset.md"
+    json_out = tmp_path / "subset.json"
+
+    rc = main(
+        [
+            "--provider",
+            "fake_replay",
+            "--max-turns",
+            "10",
+            "--scenarios",
+            "ops_alert_storm_convergence",
+            "--arms",
+            "group_a",
+            "group_c",
+            "--trace-dir",
+            str(trace_dir),
+            "--output",
+            str(md_out),
+            "--json-output",
+            str(json_out),
+        ]
+    )
+    assert rc == 0
+    md_text = md_out.read_text(encoding="utf-8")
+    assert "## Tool Call Traces" in md_text
+
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
+    assert [arm["arm_id"] for arm in payload["arms"]] == ["group_a", "group_c"]
+    for arm in payload["arms"]:
+        assert len(arm["records"]) == 1
+        rec = arm["records"][0]
+        assert rec["tool_trace"], "Expected compact tool_trace entries"
+        for step in rec["tool_trace"]:
+            assert {"turn", "tool", "blocked", "is_error"}.issubset(step.keys())
+        assert rec["trace_paths"], "Expected persisted checkpoint.jsonl paths"
+        for trace_path in rec["trace_paths"]:
+            p = Path(trace_path)
+            assert p.is_file() and p.name == "checkpoint.jsonl"
+            lines = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line]
+            assert any(ev.get("event_type") == "tool_step" for ev in lines)

@@ -209,7 +209,7 @@ def test_anthropic_openai_chat_and_responses_wire_normalization() -> None:
 
 
 def test_model_config_loads_all_four_providers() -> None:
-    """configs/models.yaml loads cleanly and constructs FakeReplayModelAdapter."""
+    """configs/models.yaml loads cleanly, validates free providers, and builds FakeReplay."""
     default_name, providers = load_model_configs(REPO_ROOT / "configs" / "models.yaml")
     assert default_name == "fake_replay"
     assert set(providers.keys()) == {
@@ -217,11 +217,157 @@ def test_model_config_loads_all_four_providers() -> None:
         "openai_chat",
         "openai_responses",
         "fake_replay",
+        "openrouter_free",
+        "openrouter_free_router",
+        "opencode_free",
+        "gemini_free",
     }
+    expected_urls = {
+        "openrouter_free": "https://openrouter.ai/api/v1",
+        "openrouter_free_router": "https://openrouter.ai/api/v1",
+        "opencode_free": "https://opencode.ai/zen/v1",
+        "gemini_free": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    }
+    for free_name, base_url in expected_urls.items():
+        cfg = providers[free_name]
+        assert cfg.base_url == base_url
+        assert cfg.pricing_per_1m_tokens.input == 0.0
+        assert cfg.pricing_per_1m_tokens.cached_input == 0.0
+        assert cfg.pricing_per_1m_tokens.output == 0.0
     adapter = build_model_adapter(
         replay_responses=[TurnResponse(content="ok", tool_calls=[])]
     )
     assert isinstance(adapter, FakeReplayModelAdapter)
+
+
+def test_openai_chat_adapter_records_requests_handles_bad_args_and_retries_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenAIChatAdapter records TurnRequests, handles malformed args/ids, and retries 429s."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.adapters.model_adapter.time.sleep", sleeps.append)
+
+    class _RateLimitErr(Exception):
+        def __init__(self) -> None:
+            super().__init__("rate limited")
+            self.status_code = 429
+            self.response = type(
+                "_Resp", (), {"status_code": 429, "headers": {"Retry-After": "1"}}
+            )()
+
+    calls = 0
+
+    class _Completions:
+        def create(self, **kwargs: object) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise _RateLimitErr()
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": "{not-valid-json",
+                                    },
+                                    "extra_content": {"google": {"thought_signature": "sig-123"}},
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 10},
+            }
+
+    fake_client = type("_Client", (), {"chat": type("_Chat", (), {"completions": _Completions()})()})()
+    cfg = ProviderConfig(
+        api_protocol="openai_chat",
+        model="nvidia/nemotron-3-ultra-550b-a55b:free",
+        base_url="https://openrouter.ai/api/v1",
+        max_retries=2,
+    )
+    adapter = OpenAIChatAdapter(cfg, client=fake_client)
+    req = TurnRequest(
+        static_system_prompt="SYS",
+        messages=[
+            Message(role="user", content="hi"),
+            Message(role="assistant", content="", tool_calls=[ToolCall(id="x", name="read_file")]),
+        ],
+    )
+    payload = adapter.build_payload(req)
+    assert payload["messages"][-1]["content"] == ""
+    assert "extra_content" not in payload["messages"][-1]["tool_calls"][0]
+
+    resp = adapter.complete(req)
+    assert calls == 2
+    assert sleeps == [1.0]
+    assert len(adapter.recorded_requests) == 1
+    assert resp.tool_calls[0].id == "tc-0"
+    assert resp.tool_calls[0].arguments == {"_raw_arguments": "{not-valid-json"}
+    assert resp.tool_calls[0].extra_content == {"google": {"thought_signature": "sig-123"}}
+
+    round_trip_payload = adapter.build_payload(
+        TurnRequest(
+            static_system_prompt="SYS",
+            messages=[
+                Message(role="user", content="hi"),
+                Message(role="assistant", content="", tool_calls=resp.tool_calls),
+            ],
+        )
+    )
+    assert round_trip_payload["messages"][-1]["tool_calls"][0]["extra_content"] == {
+        "google": {"thought_signature": "sig-123"}
+    }
+
+
+def test_apply_patch_normalizes_prefixless_headers_preserving_hunks_and_jail(
+    tmp_path: Path,
+) -> None:
+    """apply_patch normalizes missing a/ b/ prefixes outside hunks while enforcing jailing."""
+    ws = tmp_path / "ws"
+    (ws / "dbt_project").mkdir(parents=True)
+    sql_file = ws / "dbt_project" / "sample.sql"
+    sql_file.write_text("-- old comment\nSELECT 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-b", "main"], cwd=ws, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=ws, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@e"], cwd=ws, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=ws, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True)
+
+    reg = ToolRegistry(workspace_dir=ws)
+    prefixless_patch = (
+        "--- dbt_project/sample.sql\n"
+        "+++ dbt_project/sample.sql\n"
+        "@@ -1,2 +1,2 @@\n"
+        "--- old comment\n"
+        "+++ new comment\n"
+        " SELECT 1\n"
+    )
+    ok = reg.execute(
+        ToolCall(id="ok-patch", name="apply_patch", arguments={"patch": prefixless_patch})
+    )
+    assert ok.is_error is False, ok.output
+    assert sql_file.read_text(encoding="utf-8") == "++ new comment\nSELECT 1\n"
+
+    bad_patch = (
+        "--- ../outside.sql\n"
+        "+++ ../outside.sql\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+    )
+    blocked = reg.execute(
+        ToolCall(id="bad-patch", name="apply_patch", arguments={"patch": bad_patch})
+    )
+    assert blocked.is_error is True
+    assert blocked.blocked is True
 
 
 def test_six_orthogonal_tools_boundaries_and_jailing(tmp_path: Path) -> None:

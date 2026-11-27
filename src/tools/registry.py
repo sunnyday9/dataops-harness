@@ -55,6 +55,104 @@ SKIP_GREP_DIRS = frozenset(
 )
 
 
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
+def _strip_dot_slash(raw_path: str) -> str:
+    cleaned = raw_path
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned
+
+
+def _normalize_header_path(raw_path: str, prefix: str) -> str:
+    stripped = raw_path.strip()
+    if (
+        not stripped
+        or stripped in {"/dev/null", ".."}
+        or stripped.startswith(('"', "/", "a/", "b/", "../"))
+    ):
+        return stripped
+    cleaned = _strip_dot_slash(stripped)
+    return f"{prefix}{cleaned}"
+
+
+def _normalize_unified_diff_headers(patch_text: str) -> str:
+    """Ensure prefix-less diff file headers carry standard a/ and b/ prefixes outside hunks."""
+    lines = patch_text.splitlines()
+    out: list[str] = []
+    old_rem = 0
+    new_rem = 0
+    idx = 0
+
+    while idx < len(lines):
+        line = lines[idx]
+        if old_rem > 0 or new_rem > 0:
+            if line.startswith("-"):
+                old_rem = max(old_rem - 1, 0)
+            elif line.startswith("+"):
+                new_rem = max(new_rem - 1, 0)
+            elif not line.startswith("\\ No newline"):
+                old_rem = max(old_rem - 1, 0)
+                new_rem = max(new_rem - 1, 0)
+            out.append(line)
+            idx += 1
+            continue
+
+        hunk_match = _HUNK_HEADER_RE.match(line)
+        if hunk_match:
+            old_rem = int(hunk_match.group(1)) if hunk_match.group(1) is not None else 1
+            new_rem = int(hunk_match.group(2)) if hunk_match.group(2) is not None else 1
+            out.append(line)
+            idx += 1
+            continue
+
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if (
+                len(parts) == 4
+                and not parts[2].startswith(('"', "/", "a/", "b/", "../"))
+                and not parts[3].startswith(('"', "/", "a/", "b/", "../"))
+                and parts[2] != ".."
+                and parts[3] != ".."
+            ):
+                p1 = _strip_dot_slash(parts[2])
+                p2 = _strip_dot_slash(parts[3])
+                out.append(f"diff --git a/{p1} b/{p2}")
+                idx += 1
+                continue
+
+        if (
+            line.startswith("--- ")
+            and idx + 1 < len(lines)
+            and lines[idx + 1].startswith("+++ ")
+        ):
+            old_body, old_sep, old_tail = line[4:].partition("\t")
+            new_body, new_sep, new_tail = lines[idx + 1][4:].partition("\t")
+            norm_old = _normalize_header_path(old_body, "a/")
+            norm_new = _normalize_header_path(new_body, "b/")
+            out.append(f"--- {norm_old}{old_sep}{old_tail}")
+            out.append(f"+++ {norm_new}{new_sep}{new_tail}")
+            idx += 2
+            continue
+
+        out.append(line)
+        idx += 1
+
+    joined = "\n".join(out)
+    return joined + "\n"
+
+
+def extract_raw_patch_targets_safe_order(
+    registry: ToolRegistry, patch_text: str
+) -> tuple[list[str], str]:
+    """Validate original patch targets before normalization, then re-validate normalized diff."""
+    targets = registry._extract_patch_targets(patch_text)
+    normalized_patch = _normalize_unified_diff_headers(patch_text)
+    registry._extract_patch_targets(normalized_patch)
+    return targets, normalized_patch
+
+
 class ToolRegistry:
     """Registry exposing strictly the six orthogonal atomic tools (Q2 Option A)."""
 
@@ -463,8 +561,7 @@ class ToolRegistry:
                 output="Patch text must not be empty.",
                 is_error=True,
             )
-        targets = self._extract_patch_targets(patch_text)
-        normalized_patch = patch_text if patch_text.endswith("\n") else patch_text + "\n"
+        targets, normalized_patch = extract_raw_patch_targets_safe_order(self, patch_text)
 
         check_proc = subprocess.run(
             ["git", "apply", "--check", "-"],

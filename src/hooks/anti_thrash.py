@@ -162,8 +162,7 @@ class AntiThrashHook(PostToolUseHook):
         if not targets:
             return None
 
-        if not result.is_error:
-            self._invalidate_read_cache_for_targets(tracker, targets)
+        self._invalidate_read_cache_for_targets(tracker, targets)
 
         cutoff = tracker.step_index - self.recent_edit_window
         tracker.recent_file_edits = [
