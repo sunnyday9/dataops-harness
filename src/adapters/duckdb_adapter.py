@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 import duckdb
+import yaml
 
 from src.adapters.base import (
     DataDiffSummary,
@@ -107,6 +110,56 @@ class DuckDBAdapter(StorageAdapter):
             duration_ms=duration_ms,
         )
 
+    def _prepare_profiles_dir(self) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
+        profiles_file = self.paths.dbt_project_dir / "profiles.yml"
+        if not profiles_file.is_file():
+            return self.paths.dbt_project_dir, None
+
+        raw_text = profiles_file.read_text(encoding="utf-8")
+        if "DATAOPS_DUCKDB_PATH" in raw_text:
+            return self.paths.dbt_project_dir, None
+
+        resolved_mart = str(self.mart_duckdb_path.resolve())
+        rendered: str | None = None
+        try:
+            loaded = yaml.safe_load(raw_text)
+        except yaml.YAMLError:
+            if "duckdb" in raw_text.lower():
+                escaped = resolved_mart.replace("'", "''")
+                substituted = re.sub(
+                    r"^([ \t]*path[ \t]*:[ \t]*).*$",
+                    rf"\g<1>'{escaped}'",
+                    raw_text,
+                    flags=re.MULTILINE,
+                )
+                if substituted != raw_text:
+                    rendered = substituted
+        else:
+            if isinstance(loaded, dict):
+                rewritten = False
+                for profile_cfg in loaded.values():
+                    if not isinstance(profile_cfg, dict):
+                        continue
+                    outputs = profile_cfg.get("outputs")
+                    if not isinstance(outputs, dict):
+                        continue
+                    for out_cfg in outputs.values():
+                        if (
+                            isinstance(out_cfg, dict)
+                            and str(out_cfg.get("type") or "").strip().lower() == "duckdb"
+                        ):
+                            out_cfg["path"] = resolved_mart
+                            rewritten = True
+                if rewritten:
+                    rendered = yaml.safe_dump(loaded, sort_keys=False)
+
+        if rendered is None:
+            return self.paths.dbt_project_dir, None
+
+        tmp_dir = tempfile.TemporaryDirectory(prefix="dataops_dbt_profiles_")
+        (Path(tmp_dir.name) / "profiles.yml").write_text(rendered, encoding="utf-8")
+        return Path(tmp_dir.name), tmp_dir
+
     def run_dbt(
         self,
         args: list[str],
@@ -125,15 +178,20 @@ class DuckDBAdapter(StorageAdapter):
         if env_overrides:
             env.update(env_overrides)
 
-        return subprocess.run(
-            [dbt_exe, *args, "--profiles-dir", "."],
-            cwd=str(self.paths.dbt_project_dir),
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
+        profiles_dir, tmp_profiles = self._prepare_profiles_dir()
+        try:
+            return subprocess.run(
+                [dbt_exe, *args, "--profiles-dir", str(profiles_dir)],
+                cwd=str(self.paths.dbt_project_dir),
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        finally:
+            if tmp_profiles is not None:
+                tmp_profiles.cleanup()
 
     def data_diff(
         self,
