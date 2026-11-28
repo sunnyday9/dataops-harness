@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8,19 +7,21 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from src.adapters.base import LakehousePaths, LineageAdapterBase
+from src.adapters.base import LineageAdapterBase
 from src.adapters.lineage_adapter import LineageAdapter
+from src.adapters.shadow_backend import (
+    DbtExecutor,
+    ProductionReplayBackend,
+    ShadowBackend,
+    capture_incremental_blocks,
+    create_shadow_backend,
+)
 from src.adapters.spark_adapter import SparkJobRunner
 from src.core.context import CheckpointStore, Message, RunState, RunStatus
 from src.core.loop import HarnessLoop
 from src.core.policy import PoliciesConfig, load_policies
+from src.core.project import ResolvedProject, discover_project
 from src.core.rca import ApprovalPacket
-from src.core.shadow_verifier import (
-    DbtExecutor,
-    _default_dbt_executor,
-    execute_pipeline_subset,
-    extract_incremental_blocks,
-)
 from src.core.worktree import RunWorktreeManager
 
 
@@ -48,13 +49,17 @@ class PromotionService:
         lineage_adapter: LineageAdapterBase | None = None,
         spark_runner: SparkJobRunner | None = None,
         dbt_executor: DbtExecutor | None = None,
+        project: ResolvedProject | None = None,
+        shadow_backend: ShadowBackend | None = None,
     ) -> None:
         self.prod_workspace = prod_workspace.resolve()
         self.runs_dir = runs_dir.resolve()
         self.policies = policies or load_policies()
         self.lineage_adapter = lineage_adapter
         self._custom_spark_runner = spark_runner
-        self._dbt_executor: DbtExecutor = dbt_executor or _default_dbt_executor
+        self._custom_dbt_executor = dbt_executor
+        self._project = project
+        self._shadow_backend = shadow_backend
 
     def _load_approval_packet(self, state: RunState) -> ApprovalPacket:
         raw_packet = state.metadata.get("approval_packet")
@@ -66,7 +71,7 @@ class PromotionService:
         raise ValueError(f"ApprovalPacket not found for Run {state.run_id!r}.")
 
     def approve(self, run_id: str, *, cleanup_worktree: bool = True) -> PromotionResult:
-        """Promote an approved Run patch to production sandbox git and lakehouse."""
+        """Promote an approved Run patch to production sandbox git and local replay backend."""
         store = CheckpointStore(self.runs_dir, run_id)
         state = store.load_latest()
         if state.status != "AWAITING_APPROVAL":
@@ -83,54 +88,32 @@ class PromotionService:
         if not diff_text.strip():
             raise ValueError(f"Cannot promote Run {run_id!r}: unified diff is empty.")
 
-        changed_files = list(shadow.changed_files)
-        before_inc_blocks = {
-            rel: extract_incremental_blocks((self.prod_workspace / rel).read_text(encoding="utf-8"))
-            if rel.startswith("dbt_project/models/")
-            and rel.endswith(".sql")
-            and (self.prod_workspace / rel).is_file()
-            else []
-            for rel in changed_files
-        }
+        project = self._project or discover_project(self.prod_workspace)
+        lineage = self.lineage_adapter or LineageAdapter.from_project(project)
+        backend = self._shadow_backend or create_shadow_backend(
+            project,
+            lineage_adapter=lineage,
+            spark_runner=self._custom_spark_runner,
+            dbt_executor=self._custom_dbt_executor,
+        )
+        replay_backend = backend if isinstance(backend, ProductionReplayBackend) else None
+        if replay_backend is None:
+            raise ValueError(
+                f"Shadow backend {backend.backend_name!r} does not support local in-place replay Promotion."
+            )
 
+        changed_files = list(shadow.changed_files)
+        dbt_rel = project.dbt_project_rel if project.dbt_project_dir is not None else None
+        before_inc_blocks = capture_incremental_blocks(
+            self.prod_workspace, changed_files, dbt_project_rel=dbt_rel
+        )
+        affected = lineage.affected_downstream(changed_files)
         pre_head = subprocess.run(
             ["git", "-C", str(self.prod_workspace), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
-        prod_paths = LakehousePaths.from_workspace(self.prod_workspace)
-        backup_duckdb = self.runs_dir / run_id / ".prod_warehouse_backup.duckdb"
-        if prod_paths.prod_duckdb_path.is_file():
-            backup_duckdb.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(prod_paths.prod_duckdb_path, backup_duckdb)
-
-        backup_silver_dir = self.runs_dir / run_id / ".prod_silver_backup"
-        silver_existed_before = prod_paths.prod_silver_dir.exists()
-        silver_backed_up = False
-
-        def _cleanup_backups() -> None:
-            if backup_duckdb.is_file():
-                backup_duckdb.unlink()
-            if backup_silver_dir.exists():
-                shutil.rmtree(backup_silver_dir)
-
-        def _rollback_prod() -> None:
-            subprocess.run(
-                ["git", "-C", str(self.prod_workspace), "reset", "--hard", pre_head],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if backup_duckdb.is_file():
-                prod_paths.prod_duckdb_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(backup_duckdb, prod_paths.prod_duckdb_path)
-            if silver_backed_up:
-                if prod_paths.prod_silver_dir.exists():
-                    shutil.rmtree(prod_paths.prod_silver_dir)
-                if silver_existed_before and backup_silver_dir.is_dir():
-                    prod_paths.prod_silver_dir.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(backup_silver_dir, prod_paths.prod_silver_dir)
 
         normalized_diff = diff_text if diff_text.endswith("\n") else diff_text + "\n"
         check_proc = subprocess.run(
@@ -141,11 +124,11 @@ class PromotionService:
             check=False,
         )
         if check_proc.returncode != 0:
-            _cleanup_backups()
             raise RuntimeError(
                 f"Production git apply --check failed: {check_proc.stderr.strip()}"
             )
 
+        snapshot = replay_backend.snapshot_production(run_id, self.runs_dir, affected=affected)
         try:
             apply_proc = subprocess.run(
                 ["git", "-C", str(self.prod_workspace), "apply", "-"],
@@ -194,7 +177,8 @@ class PromotionService:
             )
             if commit_proc.returncode != 0:
                 raise RuntimeError(
-                    f"Production git commit failed: {commit_proc.stderr.strip() or commit_proc.stdout.strip()}"
+                    "Production git commit failed: "
+                    f"{commit_proc.stderr.strip() or commit_proc.stdout.strip()}"
                 )
 
             commit_sha = subprocess.run(
@@ -204,72 +188,44 @@ class PromotionService:
                 text=True,
             ).stdout.strip()
 
-            lineage = self.lineage_adapter or LineageAdapter.from_workspace(self.prod_workspace)
-            affected = lineage.affected_downstream(changed_files)
-            if affected.spark_jobs:
-                if backup_silver_dir.exists():
-                    shutil.rmtree(backup_silver_dir)
-                if silver_existed_before:
-                    backup_silver_dir.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(prod_paths.prod_silver_dir, backup_silver_dir)
-                silver_backed_up = True
-            events_dir = self.runs_dir / run_id / "prod_spark_events"
-            spark_runner = self._custom_spark_runner or SparkJobRunner(event_log_dir=events_dir)
-
-            incremental_changed = any(
-                rel.startswith("dbt_project/models/")
-                and rel.endswith(".sql")
-                and before_inc_blocks.get(rel, [])
-                != (
-                    extract_incremental_blocks(
-                        (self.prod_workspace / rel).read_text(encoding="utf-8")
-                    )
-                    if (self.prod_workspace / rel).is_file()
-                    else []
-                )
-                for rel in changed_files
+            after_inc_blocks = capture_incremental_blocks(
+                self.prod_workspace, changed_files, dbt_project_rel=dbt_rel
             )
+            incremental_changed = before_inc_blocks != after_inc_blocks
 
-            (
-                spark_runs,
-                _overrides,
-                dbt_run_ok,
-                dbt_test_ok,
-                _dbt_out,
-                _dbt_err,
-                failures,
-            ) = execute_pipeline_subset(
-                code_workspace=self.prod_workspace,
-                raw_dir=prod_paths.raw_dir,
-                prod_silver_dir=prod_paths.prod_silver_dir,
-                target_silver_dir=prod_paths.prod_silver_dir,
-                target_duckdb_path=prod_paths.prod_duckdb_path,
+            exec_res = replay_backend.replay_production(
                 changed_files=changed_files,
-                affected_spark_jobs=affected.spark_jobs,
-                affected_dbt_models=affected.dbt_models,
-                spark_runner=spark_runner,
-                dbt_executor=self._dbt_executor,
+                affected=affected,
                 full_refresh=not incremental_changed,
+                run_id=run_id,
+                runs_dir=self.runs_dir,
             )
-            if failures or not dbt_run_ok or not dbt_test_ok:
+            if exec_res.failure_reasons or not exec_res.dbt_run_ok or not exec_res.dbt_test_ok:
                 raise RuntimeError(
-                    "Production post-commit verification failed: " + "; ".join(failures)
+                    "Production post-commit verification failed: "
+                    + "; ".join(exec_res.failure_reasons)
                 )
         except (RuntimeError, OSError, subprocess.SubprocessError):
-            _rollback_prod()
-            _cleanup_backups()
+            subprocess.run(
+                ["git", "-C", str(self.prod_workspace), "reset", "--hard", pre_head],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            replay_backend.restore_production(snapshot)
+            replay_backend.cleanup_snapshot(snapshot)
             raise
 
-        _cleanup_backups()
+        replay_backend.cleanup_snapshot(snapshot)
 
         result = PromotionResult(
             run_id=run_id,
             status="RESOLVED",
             commit_sha=commit_sha,
             applied_files=changed_files,
-            spark_runs=spark_runs,
-            dbt_run_ok=dbt_run_ok,
-            dbt_test_ok=dbt_test_ok,
+            spark_runs=exec_res.spark_runs,
+            dbt_run_ok=exec_res.dbt_run_ok,
+            dbt_test_ok=exec_res.dbt_test_ok,
         )
         state.status = "RESOLVED"
         state.metadata["promotion"] = result.model_dump(mode="json")
