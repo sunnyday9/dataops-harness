@@ -64,7 +64,7 @@ def _init_git_repo(repo_dir: Path, message: str = "baseline") -> str:
     ).stdout.strip()
 
 
-def _write_delta_table(table_dir: Path, select_sql: str, schema_fields: list[tuple[str, str]]) -> None:
+def _write_delta_table(table_dir: Path, select_sql: str, schema_fields: list[tuple[str, object]]) -> None:
     """Create a real minimal Delta table via DuckDB Parquet + `_delta_log/000...000.json`."""
     table_dir.mkdir(parents=True, exist_ok=True)
     log_dir = table_dir / "_delta_log"
