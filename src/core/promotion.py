@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ from src.core.loop import HarnessLoop
 from src.core.policy import PoliciesConfig, load_policies
 from src.core.project import ResolvedProject, discover_project
 from src.core.rca import ApprovalPacket
-from src.core.worktree import RunWorktreeManager
+from src.core.worktree import RunWorktreeManager, extract_raw_patch_paths
 
 
 class PromotionResult(BaseModel):
@@ -102,7 +103,9 @@ class PromotionService:
                 f"Shadow backend {backend.backend_name!r} does not support local in-place replay Promotion."
             )
 
-        changed_files = list(shadow.changed_files)
+        normalized_diff = diff_text if diff_text.endswith("\n") else diff_text + "\n"
+        patch_paths = extract_raw_patch_paths(normalized_diff)
+        changed_files = list(dict.fromkeys(shadow.changed_files)) or list(patch_paths)
         dbt_rel = project.dbt_project_rel if project.dbt_project_dir is not None else None
         before_inc_blocks = capture_incremental_blocks(
             self.prod_workspace, changed_files, dbt_project_rel=dbt_rel
@@ -115,7 +118,6 @@ class PromotionService:
             text=True,
         ).stdout.strip()
 
-        normalized_diff = diff_text if diff_text.endswith("\n") else diff_text + "\n"
         check_proc = subprocess.run(
             ["git", "-C", str(self.prod_workspace), "apply", "--check", "-"],
             input=normalized_diff,
@@ -128,95 +130,102 @@ class PromotionService:
                 f"Production git apply --check failed: {check_proc.stderr.strip()}"
             )
 
-        snapshot = replay_backend.snapshot_production(run_id, self.runs_dir, affected=affected)
-        try:
-            apply_proc = subprocess.run(
-                ["git", "-C", str(self.prod_workspace), "apply", "-"],
-                input=normalized_diff,
-                text=True,
-                capture_output=True,
-                check=False,
+        newly_created_files = [
+            rel
+            for rel in dict.fromkeys([*changed_files, *patch_paths])
+            if not (self.prod_workspace / rel).exists()
+        ]
+        lock_cm = getattr(replay_backend, "production_write_lock", None)
+        with lock_cm() if callable(lock_cm) else nullcontext():
+            snapshot = replay_backend.snapshot_production(
+                run_id, self.runs_dir, affected=affected
             )
-            if apply_proc.returncode != 0:
-                raise RuntimeError(f"Production git apply failed: {apply_proc.stderr.strip()}")
+            try:
+                apply_proc = subprocess.run(
+                    ["git", "-C", str(self.prod_workspace), "apply", "-"],
+                    input=normalized_diff,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if apply_proc.returncode != 0:
+                    raise RuntimeError(f"Production git apply failed: {apply_proc.stderr.strip()}")
 
-            if changed_files:
                 subprocess.run(
                     ["git", "-C", str(self.prod_workspace), "add", "--", *changed_files],
                     check=True,
                     capture_output=True,
                     text=True,
                 )
-            else:
-                subprocess.run(
-                    ["git", "-C", str(self.prod_workspace), "add", "-A"],
-                    check=True,
+
+                commit_msg = (
+                    f"fix(dataops): resolve {state.incident.incident_id} (run {run_id})"
+                )
+                commit_proc = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(self.prod_workspace),
+                        "-c",
+                        "user.name=DataOps-Harness",
+                        "-c",
+                        "user.email=harness@dataops.local",
+                        "commit",
+                        "-m",
+                        commit_msg,
+                    ],
+                    check=False,
                     capture_output=True,
                     text=True,
                 )
+                if commit_proc.returncode != 0:
+                    raise RuntimeError(
+                        "Production git commit failed: "
+                        f"{commit_proc.stderr.strip() or commit_proc.stdout.strip()}"
+                    )
 
-            commit_msg = (
-                f"fix(dataops): resolve {state.incident.incident_id} (run {run_id})"
-            )
-            commit_proc = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(self.prod_workspace),
-                    "-c",
-                    "user.name=DataOps-Harness",
-                    "-c",
-                    "user.email=harness@dataops.local",
-                    "commit",
-                    "-m",
-                    commit_msg,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if commit_proc.returncode != 0:
-                raise RuntimeError(
-                    "Production git commit failed: "
-                    f"{commit_proc.stderr.strip() or commit_proc.stdout.strip()}"
+                commit_sha = subprocess.run(
+                    ["git", "-C", str(self.prod_workspace), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+                after_inc_blocks = capture_incremental_blocks(
+                    self.prod_workspace, changed_files, dbt_project_rel=dbt_rel
                 )
+                incremental_changed = before_inc_blocks != after_inc_blocks
 
-            commit_sha = subprocess.run(
-                ["git", "-C", str(self.prod_workspace), "rev-parse", "HEAD"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-
-            after_inc_blocks = capture_incremental_blocks(
-                self.prod_workspace, changed_files, dbt_project_rel=dbt_rel
-            )
-            incremental_changed = before_inc_blocks != after_inc_blocks
-
-            exec_res = replay_backend.replay_production(
-                changed_files=changed_files,
-                affected=affected,
-                full_refresh=not incremental_changed,
-                run_id=run_id,
-                runs_dir=self.runs_dir,
-            )
-            if exec_res.failure_reasons or not exec_res.dbt_run_ok or not exec_res.dbt_test_ok:
-                raise RuntimeError(
-                    "Production post-commit verification failed: "
-                    + "; ".join(exec_res.failure_reasons)
+                exec_res = replay_backend.replay_production(
+                    changed_files=changed_files,
+                    affected=affected,
+                    full_refresh=not incremental_changed,
+                    run_id=run_id,
+                    runs_dir=self.runs_dir,
                 )
-        except (RuntimeError, OSError, subprocess.SubprocessError):
-            subprocess.run(
-                ["git", "-C", str(self.prod_workspace), "reset", "--hard", pre_head],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            replay_backend.restore_production(snapshot)
+                if not exec_res.passed:
+                    raise RuntimeError(
+                        "Production post-commit verification failed: "
+                        + "; ".join(exec_res.failure_reasons or ["backend reported failure"])
+                    )
+            except Exception:
+                subprocess.run(
+                    ["git", "-C", str(self.prod_workspace), "reset", "--hard", pre_head],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                for created_rel in newly_created_files:
+                    created_path = self.prod_workspace / created_rel
+                    if created_path.is_file() or created_path.is_symlink():
+                        created_path.unlink()
+                try:
+                    replay_backend.restore_production(snapshot)
+                finally:
+                    replay_backend.cleanup_snapshot(snapshot)
+                raise
+
             replay_backend.cleanup_snapshot(snapshot)
-            raise
-
-        replay_backend.cleanup_snapshot(snapshot)
 
         result = PromotionResult(
             run_id=run_id,

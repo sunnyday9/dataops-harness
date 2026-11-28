@@ -13,7 +13,9 @@ from pydantic import BaseModel
 from src.adapters.base import AffectedSubgraph, DataDiffSummary, LakehousePaths, LineageAdapterBase
 from src.adapters.lineage_adapter import LineageAdapter
 from src.adapters.shadow_backend import (
+    CompositeShadowBackend,
     DbtExecutor,
+    DuckDBShadowBackend,
     ShadowBackend,
     ShadowContext,
     SparkSubprocessBackend,
@@ -99,17 +101,25 @@ def _iter_schema_yaml_files(dbt_dir: Path) -> list[Path]:
     subpaths = _read_dbt_subpaths(dbt_dir)
     files: list[Path] = []
     seen: set[Path] = set()
+    resolved_dbt = dbt_dir.resolve()
+    skip_dirs = frozenset({"target", "logs", "dbt_packages", ".git"})
     for rel_dir in (
         subpaths["model-paths"] + subpaths["seed-paths"] + subpaths["snapshot-paths"]
     ):
-        cand_dir = dbt_dir / rel_dir
+        cand_dir = (dbt_dir / rel_dir) if rel_dir else dbt_dir
         if not cand_dir.is_dir():
             continue
         for yml_path in sorted({*cand_dir.rglob("*.yml"), *cand_dir.rglob("*.yaml")}):
             resolved = yml_path.resolve()
-            if yml_path.is_file() and resolved not in seen:
-                seen.add(resolved)
-                files.append(yml_path)
+            if not yml_path.is_file() or resolved in seen:
+                continue
+            rel_parts = resolved.relative_to(resolved_dbt).parts if resolved.is_relative_to(resolved_dbt) else ()
+            if any(part in skip_dirs for part in rel_parts):
+                continue
+            if rel_dir == "" and len(rel_parts) == 1 and rel_parts[0] in ("dbt_project.yml", "profiles.yml", "packages.yml"):
+                continue
+            seen.add(resolved)
+            files.append(yml_path)
     return files
 
 
@@ -466,12 +476,18 @@ class ShadowOverlayVerifier:
                 if prod_paths.prod_duckdb_path.name.endswith(".duckdb")
                 else "warehouse.duckdb"
             )
+            include_silver = isinstance(
+                self.backend, (SparkSubprocessBackend, CompositeShadowBackend)
+            )
+            include_duckdb = isinstance(
+                self.backend, (DuckDBShadowBackend, CompositeShadowBackend)
+            )
             return ShadowVerificationResult(
                 passed=False,
                 run_id=run_id,
                 worktree_path=str(resolved_wt),
-                shadow_silver_dir=str(shadow_root / "silver"),
-                shadow_duckdb_path=str(shadow_root / "mart" / db_name),
+                shadow_silver_dir=str(shadow_root / "silver") if include_silver else "",
+                shadow_duckdb_path=str(shadow_root / "mart" / db_name) if include_duckdb else "",
                 backend_name=self.backend.backend_name,
                 failure_reasons=["No modified or added files found in Run worktree."],
             )
@@ -503,8 +519,10 @@ class ShadowOverlayVerifier:
                 oracle_verdict = self.oracle.verify(
                     prod_workspace=self.prod_workspace,
                     worktree_dir=resolved_wt,
-                    shadow_silver_dir=ctx.shadow_silver_dir or (ctx.shadow_root / "silver"),
-                    shadow_duckdb_path=ctx.shadow_duckdb_path or (ctx.shadow_root / "mart" / "warehouse.duckdb"),
+                    shadow_silver_dir=ctx.shadow_silver_dir
+                    or (ctx.shadow_root / ".no_silver_backend"),
+                    shadow_duckdb_path=ctx.shadow_duckdb_path
+                    or (ctx.shadow_root / ".no_duckdb_backend"),
                     changed_files=changed_files,
                     unified_diff=unified_diff,
                 )

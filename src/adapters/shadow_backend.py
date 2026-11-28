@@ -3,11 +3,13 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -24,9 +26,15 @@ from src.adapters.base import (
     LineageAdapterBase,
     LineageNode,
 )
-from src.adapters.duckdb_adapter import DuckDBAdapter
+from src.adapters.duckdb_adapter import DuckDBAdapter, compare_duckdb_relations
 from src.adapters.spark_adapter import SparkJobRunner
-from src.core.project import ResolvedProject, _read_dbt_project_yml, discover_project
+from src.core.project import (
+    ResolvedProject,
+    _discover_profile_hints,
+    _read_dbt_project_yml,
+    discover_project,
+    normalize_sql_dialect,
+)
 from src.core.rca import ShadowVerificationResult
 
 DbtExecutor = Callable[
@@ -179,6 +187,42 @@ def _snapshot_lock_path(db_path: Path) -> Path:
     return lock_dir / f"duckdb-{digest}.lock"
 
 
+_LOCK_STATE = threading.local()
+
+
+def _thread_locks() -> dict[Path, list[Any]]:
+    held = getattr(_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _LOCK_STATE.held = held
+    return held
+
+
+def _acquire_flock(
+    fd: int,
+    db_path: Path,
+    *,
+    exclusive: bool,
+    timeout_seconds: float,
+) -> None:
+    mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            fcntl.flock(fd, mode)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+            if time.monotonic() >= deadline:
+                lock_kind = "exclusive" if exclusive else "shared"
+                raise TimeoutError(
+                    f"Timed out waiting for {lock_kind} DuckDB snapshot lock on "
+                    f"{db_path} after {timeout_seconds:.2f}s"
+                ) from exc
+            time.sleep(0.02)
+
+
 @contextmanager
 def duckdb_snapshot_lock(
     db_path: Path,
@@ -186,36 +230,44 @@ def duckdb_snapshot_lock(
     exclusive: bool = False,
     timeout_seconds: float = 30.0,
 ) -> Iterator[Path]:
-    """Acquire a short-lived POSIX `flock` coordinating DuckDB snapshot reads vs. writes."""
+    """Acquire a re-entrant POSIX `flock` coordinating DuckDB snapshot reads vs. writes."""
     lock_path = _snapshot_lock_path(db_path)
+    held = _thread_locks()
+    existing = held.get(lock_path)
+    if existing is not None:
+        fd, _depth, cur_exclusive = existing
+        if exclusive and not cur_exclusive:
+            _acquire_flock(fd, db_path, exclusive=True, timeout_seconds=timeout_seconds)
+            existing[2] = True
+        existing[1] += 1
+        try:
+            yield lock_path
+        finally:
+            existing[1] -= 1
+        return
+
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
     acquired = False
     try:
-        while True:
-            try:
-                fcntl.flock(fd, mode)
-                acquired = True
-                break
-            except OSError as exc:
-                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
-                    raise
-                if time.monotonic() >= deadline:
-                    lock_kind = "exclusive" if exclusive else "shared"
-                    raise TimeoutError(
-                        f"Timed out waiting for {lock_kind} DuckDB snapshot lock on "
-                        f"{db_path} after {timeout_seconds:.2f}s"
-                    ) from exc
-                time.sleep(0.02)
+        _acquire_flock(fd, db_path, exclusive=exclusive, timeout_seconds=timeout_seconds)
+        acquired = True
+        held[lock_path] = [fd, 1, exclusive]
         yield lock_path
     finally:
-        if acquired:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(fd)
+        entry = held.get(lock_path)
+        if entry is not None and entry[0] == fd:
+            entry[1] -= 1
+            if entry[1] <= 0:
+                held.pop(lock_path, None)
+            else:
+                acquired = False
+        if lock_path not in held:
+            if acquired:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
 
 
 def _atomic_copy_file(src: Path, dst: Path) -> None:
@@ -290,14 +342,17 @@ def _normalize_dbt_rel_paths(raw: Any, defaults: Sequence[str]) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
     for item in entries:
-        cleaned = str(item).strip().replace("\\", "/")
-        if not cleaned or cleaned.startswith(("/", "~")):
+        raw_cleaned = str(item).strip().replace("\\", "/")
+        if not raw_cleaned or raw_cleaned.startswith(("/", "~")):
             continue
-        while cleaned.startswith("./"):
-            cleaned = cleaned[2:]
-        cleaned = cleaned.strip("/")
-        if not cleaned or any(seg == ".." for seg in cleaned.split("/")):
-            continue
+        while raw_cleaned.startswith("./"):
+            raw_cleaned = raw_cleaned[2:]
+        if raw_cleaned in ("", "."):
+            cleaned = ""
+        else:
+            cleaned = raw_cleaned.strip("/")
+            if not cleaned or any(seg == ".." for seg in cleaned.split("/")):
+                continue
         if cleaned not in seen:
             normalized.append(cleaned)
             seen.add(cleaned)
@@ -363,6 +418,7 @@ def _is_dbt_model_sql(
     norm_path: str,
     dbt_project_rel: str | None,
     model_paths: Sequence[str] | None = None,
+    excluded_subpaths: Sequence[str] = (),
 ) -> bool:
     if not norm_path.endswith(".sql"):
         return False
@@ -370,7 +426,27 @@ def _is_dbt_model_sql(
         cleaned = dbt_project_rel.strip("/").replace("\\", "/")
         prefix = f"{cleaned}/" if cleaned else ""
         if model_paths is not None:
-            return any(norm_path.startswith(f"{prefix}{mp}/") for mp in model_paths)
+            if any(norm_path.startswith(f"{prefix}{mp}/") for mp in model_paths if mp):
+                return True
+            if "" in model_paths:
+                if prefix and not norm_path.startswith(prefix):
+                    return False
+                rel_in_dbt = norm_path[len(prefix) :]
+                if not rel_in_dbt:
+                    return False
+                blocked = (
+                    "tests/",
+                    "data_tests/",
+                    "macros/",
+                    "target/",
+                    "logs/",
+                    "seeds/",
+                    "snapshots/",
+                    "dbt_packages/",
+                    *(f"{sub.strip('/')}/" for sub in excluded_subpaths if sub.strip("/")),
+                )
+                return not rel_in_dbt.startswith(blocked)
+            return False
         if not norm_path.startswith(prefix):
             return False
         rel_in_dbt = norm_path[len(prefix) :]
@@ -524,21 +600,36 @@ def _run_dbt_subset(
     has_dbt_project = (resolved_dbt_dir / "dbt_project.yml").is_file()
     dbt_prefix = f"{resolved_dbt_rel}/" if resolved_dbt_rel else ""
     subpaths = _read_dbt_subpaths(resolved_dbt_dir)
-    model_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["model-paths"])
-    test_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["test-paths"])
-    macro_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["macro-paths"])
-    seed_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["seed-paths"])
-    snapshot_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["snapshot-paths"])
+    test_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["test-paths"] if p)
+    macro_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["macro-paths"] if p)
+    seed_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["seed-paths"] if p)
+    snapshot_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["snapshot-paths"] if p)
+    model_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["model-paths"] if p)
+    non_model_subpaths = (
+        subpaths["test-paths"]
+        + subpaths["macro-paths"]
+        + subpaths["seed-paths"]
+        + subpaths["snapshot-paths"]
+    )
     all_dbt_prefixes = (
         model_prefixes + test_prefixes + macro_prefixes + seed_prefixes + snapshot_prefixes
     )
     dbt_config_files = (f"{dbt_prefix}dbt_project.yml", f"{dbt_prefix}profiles.yml")
     norm_changed = [path.replace("\\", "/").lstrip("./") for path in changed_files]
 
+    def _is_model_path(norm_path: str) -> bool:
+        return _is_dbt_model_sql(
+            norm_path,
+            resolved_dbt_rel,
+            model_paths=subpaths["model-paths"],
+            excluded_subpaths=non_model_subpaths,
+        )
+
     touches_dbt = bool(affected_dbt_models) or any(
         (path.startswith(dbt_prefix) if dbt_prefix else False)
         or path.startswith(all_dbt_prefixes)
         or path in dbt_config_files
+        or _is_model_path(path)
         for path in norm_changed
     )
     if not has_dbt_project and not touches_dbt and dbt_executor is _default_dbt_executor:
@@ -593,16 +684,18 @@ def _run_dbt_subset(
         path.startswith(macro_prefixes + test_prefixes)
         or path.endswith((".yml", ".yaml", "profiles.yml", "dbt_project.yml", "spark_config.py"))
         for path in norm_changed
-    )
+    ) or ((bool(spark_runs) or touches_seeds) and not affected_dbt_models)
     inferred_models: list[str] = []
-    if not affected_dbt_models:
-        for path in norm_changed:
-            if path.endswith(".sql") and path.startswith(model_prefixes):
-                selector = f"{Path(path).stem}+"
+    affected_set = set(affected_dbt_models)
+    for path in norm_changed:
+        if _is_model_path(path):
+            stem = Path(path).stem
+            if stem not in affected_set:
+                selector = f"{stem}+"
                 if selector not in inferred_models:
                     inferred_models.append(selector)
 
-    select_targets = list(affected_dbt_models) or inferred_models
+    select_targets = list(dict.fromkeys([*affected_dbt_models, *inferred_models]))
     run_args = ["run"]
     if full_refresh:
         run_args.append("--full-refresh")
@@ -673,62 +766,7 @@ def _delta_data_diff(
                 (col for col in shared if col == "id" or col.endswith(("_id", "_date"))),
                 shared[0],
             )
-
-        q_key = _quote_ident(resolved_key)
-        prod_count = int(con.execute("SELECT COUNT(*) FROM prod_tbl;").fetchone()[0])
-        shadow_count = int(con.execute("SELECT COUNT(*) FROM shadow_tbl;").fetchone()[0])
-
-        added_keys = [
-            str(r[0])
-            for r in con.execute(
-                f"SELECT CAST(s.{q_key} AS VARCHAR) FROM shadow_tbl s "
-                f"LEFT JOIN prod_tbl p ON s.{q_key} = p.{q_key} "
-                f"WHERE p.{q_key} IS NULL ORDER BY 1;"
-            ).fetchall()
-        ]
-        removed_keys = [
-            str(r[0])
-            for r in con.execute(
-                f"SELECT CAST(p.{q_key} AS VARCHAR) FROM prod_tbl p "
-                f"LEFT JOIN shadow_tbl s ON p.{q_key} = s.{q_key} "
-                f"WHERE s.{q_key} IS NULL ORDER BY 1;"
-            ).fetchall()
-        ]
-
-        shared_non_keys = [col for col in prod_cols if col in shadow_cols and col != resolved_key]
-        changed_keys: list[str] = []
-        if set(prod_cols) != set(shadow_cols):
-            changed_keys = [
-                str(r[0])
-                for r in con.execute(
-                    f"SELECT CAST(s.{q_key} AS VARCHAR) FROM shadow_tbl s "
-                    f"INNER JOIN prod_tbl p ON s.{q_key} = p.{q_key} ORDER BY 1;"
-                ).fetchall()
-            ]
-        elif shared_non_keys:
-            predicates = " OR ".join(
-                f"p.{_quote_ident(c)} IS DISTINCT FROM s.{_quote_ident(c)}"
-                for c in shared_non_keys
-            )
-            changed_keys = [
-                str(r[0])
-                for r in con.execute(
-                    f"SELECT CAST(s.{q_key} AS VARCHAR) FROM shadow_tbl s "
-                    f"INNER JOIN prod_tbl p ON s.{q_key} = p.{q_key} "
-                    f"WHERE {predicates} ORDER BY 1;"
-                ).fetchall()
-            ]
-
-        return DataDiffSummary(
-            table_name=table_name,
-            key_column=resolved_key,
-            prod_row_count=prod_count,
-            shadow_row_count=shadow_count,
-            added_keys=added_keys,
-            removed_keys=removed_keys,
-            changed_keys=changed_keys,
-            is_identical=not (added_keys or removed_keys or changed_keys),
-        )
+        return compare_duckdb_relations(con, "prod_tbl", "shadow_tbl", table_name, resolved_key)
     except (duckdb.Error, KeyError, OSError):
         return None
     finally:
@@ -834,6 +872,50 @@ class DuckDBShadowBackend:
         assert result is not None
         return result
 
+    def _resolve_materialized_mart_targets(
+        self, prod_db: Path
+    ) -> list[tuple[str, str]]:
+        targets = _discover_mart_diff_targets(self.lineage_adapter)
+        if not targets or self.lineage_adapter is None:
+            return targets
+        aliases_fn = getattr(self.lineage_adapter, "all_aliases", None)
+        alias_map = aliases_fn() if callable(aliases_fn) else {}
+        if not isinstance(alias_map, dict) or not alias_map:
+            return targets
+
+        con = duckdb.connect(str(prod_db.resolve()), read_only=True)
+        try:
+            prod_tables_ci = {
+                row[0].lower(): row[0]
+                for row in con.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main'"
+                ).fetchall()
+            }
+        finally:
+            con.close()
+
+        canonical_to_bare: dict[str, list[str]] = {}
+        for alias_name, canonical in alias_map.items():
+            if "." not in alias_name and alias_name.lower() != canonical.lower():
+                canonical_to_bare.setdefault(canonical.lower(), []).append(alias_name)
+
+        resolved: list[tuple[str, str]] = []
+        for model_name, key_col in targets:
+            if model_name.lower() in prod_tables_ci:
+                resolved.append((prod_tables_ci[model_name.lower()], key_col))
+                continue
+            matched = next(
+                (
+                    prod_tables_ci[cand.lower()]
+                    for cand in canonical_to_bare.get(model_name.lower(), [])
+                    if cand.lower() in prod_tables_ci
+                ),
+                None,
+            )
+            resolved.append((matched or model_name, key_col))
+        return resolved
+
     def diff_against_prod(self, ctx: ShadowContext) -> list[DataDiffSummary]:
         prod_db = self.prod_paths.prod_duckdb_path
         shadow_db = ctx.shadow_duckdb_path
@@ -843,7 +925,7 @@ class DuckDBShadowBackend:
         adapter = DuckDBAdapter(self.prod_paths)
         diffs: list[DataDiffSummary] = []
         with duckdb_snapshot_lock(prod_db, exclusive=False, timeout_seconds=self.lock_timeout_seconds):
-            for table_name, key_col in _discover_mart_diff_targets(self.lineage_adapter):
+            for table_name, key_col in self._resolve_materialized_mart_targets(prod_db):
                 try:
                     diffs.append(
                         adapter.data_diff(
@@ -861,6 +943,16 @@ class DuckDBShadowBackend:
         if ctx.shadow_root.exists():
             shutil.rmtree(ctx.shadow_root, ignore_errors=True)
 
+    @contextmanager
+    def production_write_lock(self) -> Iterator[Path]:
+        """Hold the exclusive DuckDB snapshot lock across production replay + rollback."""
+        with duckdb_snapshot_lock(
+            self.prod_paths.prod_duckdb_path,
+            exclusive=True,
+            timeout_seconds=self.lock_timeout_seconds,
+        ) as lock_path:
+            yield lock_path
+
     def snapshot_production(
         self,
         run_id: str,
@@ -869,25 +961,30 @@ class DuckDBShadowBackend:
         affected: AffectedSubgraph,
     ) -> ProductionSnapshot:
         del affected
-        prod_db = self.prod_paths.prod_duckdb_path
+        prod_db = self.prod_paths.prod_duckdb_path.resolve()
         prod_wal = Path(f"{prod_db}.wal")
         run_root = runs_dir.resolve() / run_id
         backup_duckdb = run_root / ".prod_warehouse_backup.duckdb"
         backup_wal = run_root / ".prod_warehouse_backup.duckdb.wal"
 
         duckdb_existed = False
+        wal_copied = False
         with duckdb_snapshot_lock(prod_db, exclusive=True, timeout_seconds=self.lock_timeout_seconds):
+            for stale in (backup_duckdb, backup_wal):
+                if stale.is_file():
+                    stale.unlink()
             if prod_db.is_file():
                 _atomic_copy_file(prod_db, backup_duckdb)
                 duckdb_existed = True
-            if prod_wal.is_file():
+            if duckdb_existed and prod_wal.is_file():
                 _atomic_copy_file(prod_wal, backup_wal)
+                wal_copied = True
 
         return ProductionSnapshot(
             run_id=run_id,
             backend_name=self.backend_name,
             duckdb_backup_path=backup_duckdb if duckdb_existed else None,
-            duckdb_wal_backup_path=backup_wal if backup_wal.is_file() else None,
+            duckdb_wal_backup_path=backup_wal if wal_copied else None,
             duckdb_existed=duckdb_existed,
         )
 
@@ -921,27 +1018,52 @@ class DuckDBShadowBackend:
             return result
 
     def restore_production(self, snapshot: ProductionSnapshot) -> None:
-        prod_db = self.prod_paths.prod_duckdb_path
+        prod_db = self.prod_paths.prod_duckdb_path.resolve()
         prod_wal = Path(f"{prod_db}.wal")
         with duckdb_snapshot_lock(prod_db, exclusive=True, timeout_seconds=self.lock_timeout_seconds):
-            if (
-                snapshot.duckdb_existed
-                and snapshot.duckdb_backup_path is not None
-                and snapshot.duckdb_backup_path.is_file()
-            ):
-                _atomic_copy_file(snapshot.duckdb_backup_path, prod_db)
-            elif not snapshot.duckdb_existed and prod_db.exists():
-                prod_db.unlink()
-
-            if snapshot.duckdb_wal_backup_path is not None and snapshot.duckdb_wal_backup_path.is_file():
-                _atomic_copy_file(snapshot.duckdb_wal_backup_path, prod_wal)
-            elif prod_wal.exists():
-                prod_wal.unlink()
+            if snapshot.duckdb_existed:
+                if (
+                    snapshot.duckdb_backup_path is not None
+                    and snapshot.duckdb_backup_path.is_file()
+                ):
+                    _atomic_copy_file(snapshot.duckdb_backup_path, prod_db)
+                if (
+                    snapshot.duckdb_wal_backup_path is not None
+                    and snapshot.duckdb_wal_backup_path.is_file()
+                ):
+                    _atomic_copy_file(snapshot.duckdb_wal_backup_path, prod_wal)
+                elif prod_wal.exists():
+                    prod_wal.unlink()
+            else:
+                if prod_db.exists():
+                    prod_db.unlink()
+                if prod_wal.exists():
+                    prod_wal.unlink()
 
     def cleanup_snapshot(self, snapshot: ProductionSnapshot) -> None:
         for path in (snapshot.duckdb_backup_path, snapshot.duckdb_wal_backup_path):
             if path is not None and path.is_file():
                 path.unlink()
+
+
+def _find_dir_ci(
+    parent: Path,
+    name: str,
+    *,
+    exclude_symlinks: bool = False,
+) -> Path | None:
+    exact = parent / name
+    if exact.is_dir() and not (exclude_symlinks and exact.is_symlink()):
+        return exact.resolve()
+    if not parent.is_dir():
+        return None
+    target_lower = name.lower()
+    for entry in sorted(parent.iterdir()):
+        if entry.name.lower() == target_lower and entry.is_dir():
+            if exclude_symlinks and entry.is_symlink():
+                continue
+            return entry.resolve()
+    return None
 
 
 class SparkSubprocessBackend:
@@ -963,15 +1085,23 @@ class SparkSubprocessBackend:
         self.spark_runner = spark_runner
         self.preserve_artifacts = preserve_artifacts
 
-    def _spark_jobs_rel(self) -> str:
+    def _spark_jobs_rel(self) -> str | None:
         spark_dir = self.project.spark_jobs_dir
         if spark_dir is None:
-            return ""
+            return None
         try:
             rel = spark_dir.resolve().relative_to(self.project.repo_root.resolve()).as_posix()
         except ValueError:
-            return ""
+            return None
         return "" if rel == "." else rel.strip("/")
+
+    @staticmethod
+    def _matches_spark_dir(norm_path: str, spark_dir_rel: str) -> bool:
+        if not norm_path.endswith(".py"):
+            return False
+        if spark_dir_rel == "":
+            return "/" not in norm_path
+        return norm_path.startswith(f"{spark_dir_rel}/")
 
     def _resolve_spark_jobs(
         self,
@@ -979,19 +1109,40 @@ class SparkSubprocessBackend:
         changed_files: Sequence[str],
         affected: AffectedSubgraph,
     ) -> list[str]:
-        spark_jobs = list(affected.spark_jobs)
+        spark_jobs = [p.replace("\\", "/").lstrip("./") for p in affected.spark_jobs]
         spark_dir_rel = self._spark_jobs_rel()
-        if not spark_jobs and spark_dir_rel:
-            prefix = f"{spark_dir_rel}/"
+        if spark_dir_rel is not None:
+            touches_config = False
             for rel in changed_files:
                 norm = rel.replace("\\", "/").lstrip("./")
-                if (
-                    norm.startswith(prefix)
-                    and norm.endswith(".py")
-                    and not norm.endswith(("/__init__.py", "/spark_config.py"))
-                    and norm not in spark_jobs
-                ):
+                if not self._matches_spark_dir(norm, spark_dir_rel):
+                    continue
+                fname = Path(norm).name
+                if fname == "spark_config.py":
+                    touches_config = True
+                    continue
+                if fname == "__init__.py":
+                    continue
+                if norm not in spark_jobs:
                     spark_jobs.append(norm)
+            if touches_config and self.project.spark_jobs_dir is not None:
+                for node in _all_nodes_from(self.lineage_adapter).values():
+                    if node.engine == "spark" and node.file_path:
+                        nf = node.file_path.replace("\\", "/").lstrip("./")
+                        if nf not in spark_jobs:
+                            spark_jobs.append(nf)
+                spark_dir = self.project.spark_jobs_dir.resolve()
+                candidates = (
+                    spark_dir.iterdir() if spark_dir_rel == "" else spark_dir.rglob("*.py")
+                )
+                for cand in sorted(candidates):
+                    if not cand.is_file() or cand.suffix != ".py":
+                        continue
+                    if cand.name in ("__init__.py", "spark_config.py"):
+                        continue
+                    cand_rel = cand.relative_to(self.project.repo_root.resolve()).as_posix()
+                    if cand_rel not in spark_jobs:
+                        spark_jobs.append(cand_rel)
         return order_spark_jobs(spark_jobs, lineage_adapter=self.lineage_adapter)
 
     def prepare_shadow(self, run_id: str, worktree_dir: Path, runs_dir: Path) -> ShadowContext:
@@ -1034,11 +1185,11 @@ class SparkSubprocessBackend:
         events_dir.mkdir(parents=True, exist_ok=True)
 
         all_nodes = _all_nodes_from(self.lineage_adapter)
-        job_to_table = {
-            node.file_path.replace("\\", "/").lstrip("./"): name
-            for name, node in all_nodes.items()
-            if node.engine == "spark" and node.file_path
-        }
+        job_to_tables: dict[str, list[str]] = {}
+        for name, node in all_nodes.items():
+            if node.engine == "spark" and node.file_path:
+                norm_fp = node.file_path.replace("\\", "/").lstrip("./")
+                job_to_tables.setdefault(norm_fp, []).append(name)
 
         runner = self.spark_runner or SparkJobRunner(event_log_dir=events_dir)
         spark_runs: list[dict[str, Any]] = []
@@ -1056,30 +1207,39 @@ class SparkSubprocessBackend:
                 )
 
             args = ["--raw-dir", str(self.prod_paths.raw_dir), "--output-dir", str(target_silver_dir)]
-            table_name = job_to_table.get(norm_job)
-            node = _lookup_node_ci(all_nodes, table_name) if table_name else None
-            upstream_spark_tables = [
-                up
-                for up in (node.upstream if node is not None else [])
-                if (_up_node := _lookup_node_ci(all_nodes, up)) is not None
-                and _up_node.engine == "spark"
-            ]
+            produced_tables = job_to_tables.get(norm_job, [])
+            produced_lower = {tbl.lower() for tbl in produced_tables}
+            upstream_spark_tables: list[str] = []
+            seen_ups_lower: set[str] = set()
+            for tbl in produced_tables:
+                node = _lookup_node_ci(all_nodes, tbl)
+                if node is None:
+                    continue
+                for up in node.upstream:
+                    up_node = _lookup_node_ci(all_nodes, up)
+                    if (
+                        up_node is not None
+                        and up_node.engine == "spark"
+                        and up_node.name.lower() not in produced_lower
+                        and up_node.name.lower() not in seen_ups_lower
+                    ):
+                        upstream_spark_tables.append(up_node.name)
+                        seen_ups_lower.add(up_node.name.lower())
+
             if upstream_spark_tables:
-                has_shadow_upstream = any(up in silver_overrides for up in upstream_spark_tables)
+                overrides_lower = {k.lower(): v for k, v in silver_overrides.items()}
+                has_shadow_upstream = any(up.lower() in overrides_lower for up in upstream_spark_tables)
                 if has_shadow_upstream:
                     for up in upstream_spark_tables:
-                        if up in silver_overrides:
+                        if up.lower() in overrides_lower:
                             continue
-                        prod_up = self.prod_paths.prod_silver_dir / up
-                        tgt_up = target_silver_dir / up
-                        if prod_up.exists() and not tgt_up.exists():
+                        prod_up = _find_dir_ci(self.prod_paths.prod_silver_dir, up)
+                        if prod_up is not None and _find_dir_ci(target_silver_dir, up) is None:
+                            tgt_up = target_silver_dir / prod_up.name
                             try:
-                                tgt_up.symlink_to(prod_up.resolve())
+                                tgt_up.symlink_to(prod_up)
                             except OSError:
-                                if prod_up.is_dir():
-                                    shutil.copytree(prod_up, tgt_up, dirs_exist_ok=True)
-                                else:
-                                    shutil.copy2(prod_up, tgt_up)
+                                shutil.copytree(prod_up, tgt_up, dirs_exist_ok=True)
                     silver_read = target_silver_dir
                 else:
                     silver_read = self.prod_paths.prod_silver_dir
@@ -1087,7 +1247,7 @@ class SparkSubprocessBackend:
 
             pre_existing_dirs = (
                 {p.name for p in target_silver_dir.iterdir() if p.is_dir() and not p.is_symlink()}
-                if is_shadow_target and table_name is None and target_silver_dir.is_dir()
+                if is_shadow_target and not produced_tables and target_silver_dir.is_dir()
                 else set()
             )
             res = runner.run_job(script_path, args=args)
@@ -1102,10 +1262,11 @@ class SparkSubprocessBackend:
                     ],
                 )
 
-            if table_name:
-                written = target_silver_dir / table_name
-                if written.is_dir():
-                    silver_overrides[table_name] = written.resolve()
+            if produced_tables:
+                for table_name in produced_tables:
+                    written = _find_dir_ci(target_silver_dir, table_name, exclude_symlinks=True)
+                    if written is not None:
+                        silver_overrides[table_name] = written
             elif is_shadow_target and target_silver_dir.is_dir():
                 for entry in sorted(target_silver_dir.iterdir()):
                     if (
@@ -1154,7 +1315,9 @@ class SparkSubprocessBackend:
         diffs: list[DataDiffSummary] = []
         for table_name in sorted(ctx.silver_overrides):
             shadow_dir = ctx.silver_overrides[table_name]
-            prod_dir = self.prod_paths.prod_silver_dir / table_name
+            prod_dir = _find_dir_ci(self.prod_paths.prod_silver_dir, table_name) or (
+                self.prod_paths.prod_silver_dir / table_name
+            )
             node = _lookup_node_ci(all_nodes, table_name)
             key_col = _infer_key_column(node) if node is not None else None
             summary = _delta_data_diff(prod_dir, shadow_dir, table_name, key_col)
@@ -1165,6 +1328,18 @@ class SparkSubprocessBackend:
     def teardown(self, ctx: ShadowContext) -> None:
         if ctx.shadow_root.exists():
             shutil.rmtree(ctx.shadow_root, ignore_errors=True)
+
+    def _will_run_spark(self, affected: AffectedSubgraph) -> bool:
+        if affected.spark_jobs:
+            return True
+        if affected.changed_paths:
+            return bool(
+                self._resolve_spark_jobs(
+                    changed_files=affected.changed_paths,
+                    affected=affected,
+                )
+            )
+        return self.project.spark_jobs_dir is not None
 
     def snapshot_production(
         self,
@@ -1177,7 +1352,7 @@ class SparkSubprocessBackend:
         backup_silver_dir = runs_dir.resolve() / run_id / ".prod_silver_backup"
         silver_existed = prod_silver.exists()
         silver_backed_up = False
-        if affected.spark_jobs or self.project.spark_jobs_dir is not None:
+        if self._will_run_spark(affected):
             if backup_silver_dir.exists():
                 shutil.rmtree(backup_silver_dir)
             if silver_existed:
@@ -1336,6 +1511,12 @@ class CompositeShadowBackend:
         if ctx.shadow_root.exists():
             shutil.rmtree(ctx.shadow_root, ignore_errors=True)
 
+    @contextmanager
+    def production_write_lock(self) -> Iterator[Path]:
+        """Coordinate concurrent DuckDB reads across Composite promotion replay and rollback."""
+        with self.warehouse_backend.production_write_lock() as lock_path:
+            yield lock_path
+
     def snapshot_production(
         self,
         run_id: str,
@@ -1344,11 +1525,15 @@ class CompositeShadowBackend:
         affected: AffectedSubgraph,
     ) -> ProductionSnapshot:
         db_snap = self.warehouse_backend.snapshot_production(run_id, runs_dir, affected=affected)
-        sp_snap = (
-            self.spark_backend.snapshot_production(run_id, runs_dir, affected=affected)
-            if affected.spark_jobs
-            else ProductionSnapshot(run_id=run_id, backend_name=self.backend_name)
-        )
+        try:
+            sp_snap = (
+                self.spark_backend.snapshot_production(run_id, runs_dir, affected=affected)
+                if self.spark_backend._will_run_spark(affected)
+                else ProductionSnapshot(run_id=run_id, backend_name=self.backend_name)
+            )
+        except Exception:
+            self.warehouse_backend.cleanup_snapshot(db_snap)
+            raise
         return ProductionSnapshot(
             run_id=run_id,
             backend_name=self.backend_name,
@@ -1391,11 +1576,23 @@ class CompositeShadowBackend:
         )
 
     def restore_production(self, snapshot: ProductionSnapshot) -> None:
-        self.warehouse_backend.restore_production(snapshot)
+        warehouse_done = False
+        try:
+            self.warehouse_backend.restore_production(snapshot)
+            warehouse_done = True
+        finally:
+            if not warehouse_done:
+                self.spark_backend.restore_production(snapshot)
         self.spark_backend.restore_production(snapshot)
 
     def cleanup_snapshot(self, snapshot: ProductionSnapshot) -> None:
-        self.warehouse_backend.cleanup_snapshot(snapshot)
+        warehouse_done = False
+        try:
+            self.warehouse_backend.cleanup_snapshot(snapshot)
+            warehouse_done = True
+        finally:
+            if not warehouse_done:
+                self.spark_backend.cleanup_snapshot(snapshot)
         self.spark_backend.cleanup_snapshot(snapshot)
 
 
@@ -1446,7 +1643,28 @@ def register_shadow_backend(name: str, factory: ShadowBackendFactory) -> None:
     cleaned = name.strip().lower()
     if not cleaned:
         raise ValueError("Shadow backend name must not be empty.")
+    if cleaned == "none":
+        raise ValueError("Shadow backend 'none' is reserved and cannot be overridden.")
     SHADOW_BACKEND_REGISTRY[cleaned] = factory
+
+
+def _dbt_declares_non_duckdb(project: ResolvedProject) -> bool:
+    if project.dbt_manifest_path is not None and project.dbt_manifest_path.is_file():
+        try:
+            raw_manifest = json.loads(project.dbt_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_manifest = {}
+        adapter_type = (raw_manifest.get("metadata") or {}).get("adapter_type")
+        if isinstance(adapter_type, str) and adapter_type.strip():
+            return normalize_sql_dialect(adapter_type) != "duckdb"
+    if project.dbt_project_dir is not None:
+        dbt_cfg = _read_dbt_project_yml(project.dbt_project_dir, project.repo_root)
+        profile_dialect, _ = _discover_profile_hints(
+            project.repo_root, project.dbt_project_dir, dbt_cfg
+        )
+        if profile_dialect is not None:
+            return profile_dialect != "duckdb"
+    return False
 
 
 def create_shadow_backend(
@@ -1492,24 +1710,33 @@ def create_shadow_backend(
                 spark_runner=spark_runner,
             )
         if key == "duckdb":
-            duck_backend = DuckDBShadowBackend(
+            return DuckDBShadowBackend(
                 project,
                 lineage_adapter=lineage_adapter,
                 dbt_executor=dbt_executor,
                 lock_timeout_seconds=lock_timeout_seconds,
             )
-            if has_spark:
-                return CompositeShadowBackend(
-                    SparkSubprocessBackend(
-                        project,
-                        lineage_adapter=lineage_adapter,
-                        spark_runner=spark_runner,
-                    ),
-                    duck_backend,
-                )
-            return duck_backend
         raise NotImplementedError(
             f"Shadow backend {requested!r} is not implemented or registered."
+        )
+
+    dialect = (project.sql_dialect or "").strip().lower()
+    if (
+        has_dbt
+        and dialect not in ("", "duckdb")
+        and not (has_spark and dialect == "spark" and not _dbt_declares_non_duckdb(project))
+    ):
+        if dialect in SHADOW_BACKEND_REGISTRY:
+            return SHADOW_BACKEND_REGISTRY[dialect](
+                project,
+                lineage_adapter=lineage_adapter,
+                spark_runner=spark_runner,
+                dbt_executor=dbt_executor,
+                lock_timeout_seconds=lock_timeout_seconds,
+            )
+        raise NotImplementedError(
+            f"No ShadowBackend registered for discovered SQL dialect {dialect!r}. "
+            "Configure shadow.backend or register a backend."
         )
 
     if has_spark and has_dbt:
