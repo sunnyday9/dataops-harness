@@ -40,8 +40,11 @@ class ShadowVerificationResult(BaseModel):
     passed: bool
     run_id: str
     worktree_path: str
-    shadow_silver_dir: str
-    shadow_duckdb_path: str
+    shadow_silver_dir: str = ""
+    shadow_duckdb_path: str = ""
+    backend_name: str = "duckdb"
+    shadow_schema: str | None = None
+    shadow_metadata: dict[str, Any] = Field(default_factory=dict)
     changed_files: list[str] = Field(default_factory=list)
     affected_spark_jobs: list[str] = Field(default_factory=list)
     affected_dbt_models: list[str] = Field(default_factory=list)

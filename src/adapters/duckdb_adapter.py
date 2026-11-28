@@ -29,6 +29,97 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def compare_duckdb_relations(
+    con: duckdb.DuckDBPyConnection,
+    prod_ref: str,
+    shadow_ref: str,
+    table_name: str,
+    key_column: str,
+) -> DataDiffSummary:
+    """Compare prod vs. shadow relations in DuckDB using NULL-safe, multiset-aware SQL."""
+    prod_desc = [(row[0], row[1]) for row in con.execute(f"DESCRIBE {prod_ref};").fetchall()]
+    shadow_desc = [(row[0], row[1]) for row in con.execute(f"DESCRIBE {shadow_ref};").fetchall()]
+    prod_cols = [col for col, _dtype in prod_desc]
+    shadow_cols = [col for col, _dtype in shadow_desc]
+    if key_column not in prod_cols or key_column not in shadow_cols:
+        raise KeyError(f"Key column {key_column!r} missing from table {table_name!r}")
+
+    q_key = _quote_ident(key_column)
+    prod_count = int(con.execute(f"SELECT COUNT(*) FROM {prod_ref};").fetchone()[0])
+    shadow_count = int(con.execute(f"SELECT COUNT(*) FROM {shadow_ref};").fetchone()[0])
+
+    added_keys = [
+        str(r[0])
+        for r in con.execute(
+            f"SELECT DISTINCT CAST(s.{q_key} AS VARCHAR) "
+            f"FROM {shadow_ref} s "
+            f"WHERE NOT EXISTS ("
+            f"SELECT 1 FROM {prod_ref} p WHERE s.{q_key} IS NOT DISTINCT FROM p.{q_key}"
+            f") ORDER BY 1;"
+        ).fetchall()
+    ]
+    removed_keys = [
+        str(r[0])
+        for r in con.execute(
+            f"SELECT DISTINCT CAST(p.{q_key} AS VARCHAR) "
+            f"FROM {prod_ref} p "
+            f"WHERE NOT EXISTS ("
+            f"SELECT 1 FROM {shadow_ref} s WHERE p.{q_key} IS NOT DISTINCT FROM s.{q_key}"
+            f") ORDER BY 1;"
+        ).fetchall()
+    ]
+
+    schema_changed = dict(prod_desc) != dict(shadow_desc)
+    changed_keys: list[str] = []
+    if schema_changed:
+        changed_keys = [
+            str(r[0])
+            for r in con.execute(
+                f"SELECT DISTINCT CAST(s.{q_key} AS VARCHAR) "
+                f"FROM {shadow_ref} s "
+                f"WHERE EXISTS ("
+                f"SELECT 1 FROM {prod_ref} p WHERE s.{q_key} IS NOT DISTINCT FROM p.{q_key}"
+                f") ORDER BY 1;"
+            ).fetchall()
+        ]
+    elif prod_cols:
+        cols_sql = ", ".join(_quote_ident(c) for c in prod_cols)
+        changed_keys = [
+            str(r[0])
+            for r in con.execute(
+                f"WITH "
+                f"shadow_only AS ("
+                f"SELECT {cols_sql} FROM {shadow_ref} EXCEPT ALL SELECT {cols_sql} FROM {prod_ref}"
+                f"), "
+                f"prod_only AS ("
+                f"SELECT {cols_sql} FROM {prod_ref} EXCEPT ALL SELECT {cols_sql} FROM {shadow_ref}"
+                f"), "
+                f"diff_rows AS (SELECT * FROM shadow_only UNION ALL SELECT * FROM prod_only) "
+                f"SELECT DISTINCT CAST(d.{q_key} AS VARCHAR) "
+                f"FROM diff_rows d "
+                f"WHERE EXISTS ("
+                f"SELECT 1 FROM {prod_ref} p WHERE d.{q_key} IS NOT DISTINCT FROM p.{q_key}"
+                f") AND EXISTS ("
+                f"SELECT 1 FROM {shadow_ref} s WHERE d.{q_key} IS NOT DISTINCT FROM s.{q_key}"
+                f") ORDER BY 1;"
+            ).fetchall()
+        ]
+
+    is_identical = (
+        not (added_keys or removed_keys or changed_keys) and prod_count == shadow_count
+    )
+    return DataDiffSummary(
+        table_name=table_name,
+        key_column=key_column,
+        prod_row_count=prod_count,
+        shadow_row_count=shadow_count,
+        added_keys=added_keys,
+        removed_keys=removed_keys,
+        changed_keys=changed_keys,
+        is_identical=is_identical,
+    )
+
+
 class DuckDBAdapter(StorageAdapter):
     """Read-only lakehouse SQL probing, dbt runner, and table data diff via DuckDB."""
 
@@ -202,7 +293,6 @@ class DuckDBAdapter(StorageAdapter):
     ) -> DataDiffSummary:
         """Compare prod vs. shadow rows for `table_name` keyed by `key_column`."""
         q_table = _quote_ident(table_name)
-        q_key = _quote_ident(key_column)
         con = duckdb.connect(":memory:")
         try:
             con.execute(
@@ -211,85 +301,12 @@ class DuckDBAdapter(StorageAdapter):
             con.execute(
                 f"ATTACH {_sql_literal(str(shadow_db.resolve()))} AS shadow_db (READ_ONLY);"
             )
-
-            prod_cols = [
-                row[0]
-                for row in con.execute(f"DESCRIBE prod_db.main.{q_table};").fetchall()
-            ]
-            shadow_cols = [
-                row[0]
-                for row in con.execute(f"DESCRIBE shadow_db.main.{q_table};").fetchall()
-            ]
-            if key_column not in prod_cols or key_column not in shadow_cols:
-                raise KeyError(
-                    f"Key column {key_column!r} missing from table {table_name!r}"
-                )
-
-            prod_count = int(
-                con.execute(f"SELECT COUNT(*) FROM prod_db.main.{q_table};").fetchone()[0]
-            )
-            shadow_count = int(
-                con.execute(f"SELECT COUNT(*) FROM shadow_db.main.{q_table};").fetchone()[0]
-            )
-
-            added_keys = [
-                str(r[0])
-                for r in con.execute(
-                    f"SELECT CAST(s.{q_key} AS VARCHAR) "
-                    f"FROM shadow_db.main.{q_table} s "
-                    f"LEFT JOIN prod_db.main.{q_table} p ON s.{q_key} = p.{q_key} "
-                    f"WHERE p.{q_key} IS NULL ORDER BY 1;"
-                ).fetchall()
-            ]
-            removed_keys = [
-                str(r[0])
-                for r in con.execute(
-                    f"SELECT CAST(p.{q_key} AS VARCHAR) "
-                    f"FROM prod_db.main.{q_table} p "
-                    f"LEFT JOIN shadow_db.main.{q_table} s ON p.{q_key} = s.{q_key} "
-                    f"WHERE s.{q_key} IS NULL ORDER BY 1;"
-                ).fetchall()
-            ]
-
-            shared_non_keys = [
-                col for col in prod_cols if col in shadow_cols and col != key_column
-            ]
-            changed_keys: list[str] = []
-            if set(prod_cols) != set(shadow_cols):
-                changed_keys = [
-                    str(r[0])
-                    for r in con.execute(
-                        f"SELECT CAST(s.{q_key} AS VARCHAR) "
-                        f"FROM shadow_db.main.{q_table} s "
-                        f"INNER JOIN prod_db.main.{q_table} p ON s.{q_key} = p.{q_key} "
-                        f"ORDER BY 1;"
-                    ).fetchall()
-                ]
-            elif shared_non_keys:
-                predicates = " OR ".join(
-                    f"p.{_quote_ident(c)} IS DISTINCT FROM s.{_quote_ident(c)}"
-                    for c in shared_non_keys
-                )
-                changed_keys = [
-                    str(r[0])
-                    for r in con.execute(
-                        f"SELECT CAST(s.{q_key} AS VARCHAR) "
-                        f"FROM shadow_db.main.{q_table} s "
-                        f"INNER JOIN prod_db.main.{q_table} p ON s.{q_key} = p.{q_key} "
-                        f"WHERE {predicates} ORDER BY 1;"
-                    ).fetchall()
-                ]
-
-            is_identical = not (added_keys or removed_keys or changed_keys)
-            return DataDiffSummary(
-                table_name=table_name,
-                key_column=key_column,
-                prod_row_count=prod_count,
-                shadow_row_count=shadow_count,
-                added_keys=added_keys,
-                removed_keys=removed_keys,
-                changed_keys=changed_keys,
-                is_identical=is_identical,
+            return compare_duckdb_relations(
+                con,
+                f"prod_db.main.{q_table}",
+                f"shadow_db.main.{q_table}",
+                table_name,
+                key_column,
             )
         finally:
             con.close()

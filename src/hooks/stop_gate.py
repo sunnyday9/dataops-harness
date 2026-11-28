@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from src.adapters.shadow_backend import ShadowVerifierProtocol
 from src.core.context import RunState
 from src.core.rca import ApprovalPacket, parse_rca_report
-from src.core.shadow_verifier import ShadowOverlayVerifier
 from src.core.worktree import RunWorktreeManager
 from src.hooks.base import StopDecision, StopHook
 
@@ -15,12 +15,12 @@ class StopGateHook(StopHook):
 
     def __init__(
         self,
-        verifier: ShadowOverlayVerifier | None = None,
+        verifier: ShadowVerifierProtocol | None = None,
         worktree_dir: Path | None = None,
         worktree_resolver: Callable[[RunState], Path | None] | None = None,
         runs_dir: Path | None = None,
     ) -> None:
-        self.verifier = verifier
+        self.verifier: ShadowVerifierProtocol | None = verifier
         self.worktree_dir = worktree_dir.resolve() if worktree_dir is not None else None
         self.worktree_resolver = worktree_resolver
         self.runs_dir = runs_dir.resolve() if runs_dir is not None else None
@@ -60,7 +60,7 @@ class StopGateHook(StopHook):
             return StopDecision(
                 allow_stop=False,
                 feedback_message=(
-                    "Stop rejected: fix mode requires ShadowOverlayVerifier and an "
+                    "Stop rejected: fix mode requires a shadow verifier and an "
                     "isolated worktree before finishing."
                 ),
             )
