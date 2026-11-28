@@ -198,6 +198,14 @@ class _LineageProbe:
         if raw_asset in self._resolved_name_cache:
             return self._resolved_name_cache[raw_asset]
 
+        resolve_fn = getattr(self._lineage, "resolve_asset_name", None)
+        if callable(resolve_fn):
+            direct = resolve_fn(raw_asset)
+            if isinstance(direct, str) and direct:
+                self._known_cache[direct] = True
+                self._resolved_name_cache[raw_asset] = direct
+                return direct
+
         candidates = [raw_asset]
         lowered = raw_asset.lower()
         if lowered != raw_asset:
@@ -210,9 +218,15 @@ class _LineageProbe:
 
         resolved = raw_asset
         for candidate in candidates:
-            if self.is_known(candidate):
-                resolved = candidate
+            try:
+                subgraph = self._lineage.query_lineage(candidate, direction="both", depth=1)
+                self._known_cache[candidate] = True
+                canonical = subgraph.root or candidate
+                self._known_cache[canonical] = True
+                resolved = canonical
                 break
+            except KeyError:
+                self._known_cache[candidate] = False
 
         self._resolved_name_cache[raw_asset] = resolved
         return resolved
