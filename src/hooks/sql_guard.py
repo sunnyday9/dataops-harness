@@ -11,12 +11,30 @@ from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import Scope, build_scope
 
 from src.core.context import RunState, ToolCall
-from src.core.policy import PoliciesConfig, load_policies
+from src.core.policy import PoliciesConfig, load_policies, normalize_sql_dialect
 from src.hooks.base import PreToolDecision, PreToolUseHook
 
 _EXPLAIN_PREFIX_RE = re.compile(
-    r"^(?:\([^)]*\)\s*|(?:ANALYZE|FORMATTED|EXTENDED|COSTS?|CODEGEN|VERBOSE|LOGICAL|PHYSICAL|QUERY\s+PLAN)\b\s*)",
+    r"^(?:\([^)]*\)\s*|(?:ANALY[ZS]E|FORMATTED|EXTENDED|COSTS?|CODEGEN|VERBOSE|LOGICAL|PHYSICAL|QUERY\s+PLAN)\b\s*)",
     re.IGNORECASE,
+)
+_ANALYZE_OPTION_RE = re.compile(
+    r"\bANALY[ZS]E\b(?:\s*(?:=|\s)\s*(TRUE|FALSE|ON|OFF|1|0)\b)?",
+    re.IGNORECASE,
+)
+_SPARK_FILE_FORMATS = frozenset(
+    {
+        "parquet",
+        "delta",
+        "csv",
+        "json",
+        "text",
+        "orc",
+        "avro",
+        "libsvm",
+        "binaryfile",
+        "iceberg",
+    }
 )
 
 _BLOCKED_STMT_TYPES: dict[str, tuple[type[exp.Expression], ...]] = {
@@ -62,8 +80,59 @@ _ALWAYS_BLOCKED_FILE_FUNCS = frozenset(
         "read_ndjson",
         "read_ndjson_auto",
         "read_ndjson_objects",
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_ls_dir",
+        "pg_stat_file",
+        "pg_ls_logdir",
+        "pg_ls_waldir",
+        "pg_ls_tmpdir",
+        "lo_import",
+        "lo_export",
+        "dblink",
+        "dblink_exec",
+        "dblink_connect",
+        "query_to_xml",
+        "pg_terminate_backend",
+        "pg_cancel_backend",
+        "pg_reload_conf",
+        "set_config",
+        "lo_get",
+        "lo_put",
+        "lo_from_bytea",
+        "lo_unlink",
+        "pg_rotate_logfile",
+        "pg_switch_wal",
+        "cursor_to_xml",
+        "query_to_xml_and_xmlschema",
+        "reflect",
+        "java_method",
+        "xpath",
+        "xpath_string",
+        "xpath_boolean",
+        "xpath_double",
+        "xpath_float",
+        "xpath_int",
+        "xpath_long",
+        "xpath_number",
+        "xpath_short",
+        "postgres_query",
+        "mysql_query",
+        "sqlite_query",
+        "http_post",
+        "http_put",
+        "http_delete",
+        "http_patch",
+        "http_head",
+        "parquet_metadata",
+        "parquet_schema",
+        "parquet_file_metadata",
+        "parquet_kv_metadata",
     }
 )
+
+_BLOCKED_FUNC_PREFIXES = ("pragma_", "duckdb_", "pg_ls_", "pg_file_", "dblink_")
+_BLOCKED_FUNC_SUFFIXES = ("_to_xml", "_to_xmlschema", "_to_xml_and_xmlschema")
 
 
 def is_blocked_escape_func(name: str) -> bool:
@@ -71,18 +140,20 @@ def is_blocked_escape_func(name: str) -> bool:
     lowered = name.lower()
     return (
         lowered in _ALWAYS_BLOCKED_FILE_FUNCS
-        or lowered.startswith(("pragma_", "duckdb_"))
+        or lowered.startswith(_BLOCKED_FUNC_PREFIXES)
+        or lowered.endswith(_BLOCKED_FUNC_SUFFIXES)
     )
 
 _LAKEHOUSE_RELATIVE_PREFIX = "workspace/lakehouse/"
 
 
-def parse_single_statement(sql: str) -> exp.Expression:
-    """Parse `sql` in DuckDB dialect and require exactly one non-empty AST statement."""
+def parse_single_statement(sql: str, dialect: str = "duckdb") -> exp.Expression:
+    """Parse `sql` in `dialect` and require exactly one non-empty AST statement."""
     if not sql or not sql.strip():
         raise ValueError("SQL query must not be empty.")
+    read_dialect = normalize_sql_dialect(dialect)
     try:
-        parsed = sqlglot.parse(sql, read="duckdb")
+        parsed = sqlglot.parse(sql, read=read_dialect)
     except ParseError as exc:
         raise ValueError(f"Unparseable SQL: {exc}") from exc
 
@@ -100,7 +171,7 @@ def is_explain_statement(stmt: exp.Expression) -> bool:
 
 
 def is_explain_analyze(stmt: exp.Expression) -> bool:
-    """Return True if an EXPLAIN statement includes the ANALYZE option."""
+    """Return True if an EXPLAIN statement includes an active ANALYZE/ANALYSE option."""
     explain_cls = getattr(exp, "Explain", None)
     if explain_cls is not None and isinstance(stmt, explain_cls):
         return bool(stmt.args.get("analyze"))
@@ -113,13 +184,16 @@ def is_explain_analyze(stmt: exp.Expression) -> bool:
             match = _EXPLAIN_PREFIX_RE.match(cleaned)
             if not match:
                 break
-            if re.search(r"\bANALYZE\b", match.group(0), re.IGNORECASE):
-                return True
+            prefix_tok = match.group(0)
+            for opt_match in _ANALYZE_OPTION_RE.finditer(prefix_tok):
+                flag = opt_match.group(1)
+                if flag is None or flag.upper() in {"TRUE", "ON", "1"}:
+                    return True
             cleaned = cleaned[match.end() :].strip()
     return False
 
 
-def unwrap_explain(stmt: exp.Expression) -> exp.Expression:
+def unwrap_explain(stmt: exp.Expression, dialect: str = "duckdb") -> exp.Expression:
     """Extract and parse the inner SQL statement wrapped by an EXPLAIN command."""
     explain_cls = getattr(exp, "Explain", None)
     if (
@@ -139,19 +213,21 @@ def unwrap_explain(stmt: exp.Expression) -> exp.Expression:
         cleaned = cleaned[match.end() :].strip()
     if not cleaned:
         raise ValueError("EXPLAIN statement is missing an inner SQL query.")
-    return parse_single_statement(cleaned)
+    return parse_single_statement(cleaned, dialect=dialect)
 
 
-def extract_referenced_tables(stmt: exp.Expression) -> list[tuple[str, str, str]]:
+def extract_referenced_tables(
+    stmt: exp.Expression, dialect: str = "duckdb"
+) -> list[tuple[str, str, str]]:
     """Return unique `(catalog, db, table_name)` tuples referenced by real tables in `stmt`."""
     if is_explain_statement(stmt):
-        return extract_referenced_tables(unwrap_explain(stmt))
+        return extract_referenced_tables(unwrap_explain(stmt, dialect=dialect), dialect=dialect)
     if isinstance(stmt, exp.Describe):
         if isinstance(stmt.this, exp.Table) and stmt.this.name:
             t = stmt.this
             return [((t.catalog or "").lower(), (t.db or "").lower(), t.name.lower())]
         if isinstance(stmt.this, exp.Expression):
-            return extract_referenced_tables(stmt.this)
+            return extract_referenced_tables(stmt.this, dialect=dialect)
         return []
 
     seen: list[tuple[str, str, str]] = []
@@ -201,24 +277,46 @@ def _extract_string_literals(expr: exp.Expression) -> list[str]:
     return values
 
 
-def _is_path_inside_lakehouse(raw_path: str, lakehouse_dir: Path | None) -> bool:
+def _is_path_inside_lakehouse(
+    raw_path: str,
+    lakehouse_dir: Path | None,
+    workspace_dir: Path | None = None,
+) -> bool:
     cleaned = raw_path.strip().replace("\\", "/")
     if not cleaned:
         return False
     lowered = cleaned.lower()
-    if "://" in lowered:
+    if "://" in lowered or cleaned.startswith("~"):
         return False
+
+    raw_segments = [seg for seg in cleaned.split("/") if seg]
+    if ".." in raw_segments:
+        return False
+
+    # Strip glob wildcards from suffix when checking parent directory containment.
+    probe = re.split(r"[*?\[\]]", cleaned, maxsplit=1)[0].rstrip("/") or cleaned
 
     if cleaned.startswith("/") or (len(cleaned) >= 2 and cleaned[1] == ":"):
         if lakehouse_dir is None:
             return False
         try:
-            # Strip glob wildcards from suffix when checking parent directory containment.
-            probe = cleaned.split("*", 1)[0].rstrip("/") or cleaned
             resolved = Path(probe).resolve()
             return resolved.is_relative_to(lakehouse_dir)
         except OSError:
             return False
+
+    if lakehouse_dir is not None and workspace_dir is not None:
+        try:
+            candidate = (workspace_dir / probe).resolve()
+            if candidate.is_relative_to(lakehouse_dir):
+                return True
+            if workspace_dir.name == "workspace":
+                parent_cand = (workspace_dir.parent / probe).resolve()
+                if parent_cand.is_relative_to(lakehouse_dir):
+                    return True
+        except OSError:
+            return False
+        return False
 
     normalized = posixpath.normpath(cleaned).lstrip("./")
     if normalized == ".." or normalized.startswith("../"):
@@ -494,13 +592,23 @@ class SqlGuardHook(PreToolUseHook):
         self,
         policies: PoliciesConfig | None = None,
         workspace_dir: Path | None = None,
+        *,
+        dialect: str | None = None,
+        lakehouse_dir: Path | None = None,
     ) -> None:
         self.policies = policies or load_policies()
-        self.lakehouse_dir = (
-            (workspace_dir.resolve() / "lakehouse") if workspace_dir is not None else None
+        self.dialect = normalize_sql_dialect(dialect or self.policies.sql_guard.sql_dialect)
+        self.workspace_dir: Path | None = (
+            workspace_dir.resolve() if workspace_dir is not None else None
         )
+        if lakehouse_dir is not None:
+            self.lakehouse_dir: Path | None = lakehouse_dir.resolve()
+        elif self.workspace_dir is not None:
+            self.lakehouse_dir = self.workspace_dir / "lakehouse"
+        else:
+            self.lakehouse_dir = None
 
-    def _validate_statement(self, stmt: exp.Expression) -> str | None:
+    def _validate_statement(self, stmt: exp.Expression, *, dialect: str = "duckdb") -> str | None:
         guard = self.policies.sql_guard
         allowed = {name.upper() for name in guard.allowed_top_level}
 
@@ -508,16 +616,16 @@ class SqlGuardHook(PreToolUseHook):
             if "EXPLAIN" not in allowed:
                 return "EXPLAIN statements are disabled by sql_guard policy."
             try:
-                inner = unwrap_explain(stmt)
+                inner = unwrap_explain(stmt, dialect=dialect)
             except ValueError as exc:
                 return str(exc)
-            return self._validate_statement(inner)
+            return self._validate_statement(inner, dialect=dialect)
 
         if isinstance(stmt, exp.Describe):
             if "DESCRIBE" not in allowed:
                 return "DESCRIBE statements are disabled by sql_guard policy."
             if isinstance(stmt.this, exp.Expression) and not isinstance(stmt.this, exp.Table):
-                return self._validate_statement(stmt.this)
+                return self._validate_statement(stmt.this, dialect=dialect)
             return self._check_ast_safety(stmt)
 
         if isinstance(stmt, exp.Select):
@@ -530,6 +638,8 @@ class SqlGuardHook(PreToolUseHook):
         if isinstance(stmt, exp.SetOperation):
             if "UNION" not in allowed:
                 return "UNION/set-operation statements are disabled by sql_guard policy."
+            if stmt.args.get("with_") and "WITH" not in allowed:
+                return "WITH/CTE clauses are disabled by sql_guard policy."
             return self._check_ast_safety(stmt)
 
         stmt_name = type(stmt).__name__.upper()
@@ -566,7 +676,8 @@ class SqlGuardHook(PreToolUseHook):
                 if _is_file_reading_func(fn):
                     literals = _extract_string_literals(node)
                     if not literals or any(
-                        not _is_path_inside_lakehouse(p, self.lakehouse_dir) for p in literals
+                        not _is_path_inside_lakehouse(p, self.lakehouse_dir, self.workspace_dir)
+                        for p in literals
                     ):
                         return (
                             f"External file-reading function {fn!r} outside "
@@ -577,9 +688,15 @@ class SqlGuardHook(PreToolUseHook):
                 is_literal_path = isinstance(node.this, exp.Literal) and node.this.is_string
                 raw_name = node.name or ""
                 looks_like_path = "/" in raw_name or "\\" in raw_name or "://" in raw_name
+                is_format_table = (
+                    (node.db or "").lower() in _SPARK_FILE_FORMATS
+                    and isinstance(node.this, (exp.Identifier, exp.Literal))
+                )
                 if (
-                    (is_literal_path or looks_like_path)
-                    and not _is_path_inside_lakehouse(raw_name, self.lakehouse_dir)
+                    (is_literal_path or looks_like_path or is_format_table)
+                    and not _is_path_inside_lakehouse(
+                        raw_name, self.lakehouse_dir, self.workspace_dir
+                    )
                 ):
                     return (
                         f"Direct file scan outside workspace/lakehouse/ is blocked: "
@@ -587,7 +704,14 @@ class SqlGuardHook(PreToolUseHook):
                     )
         return None
 
-    def _check_limits(self, stmt: exp.Expression) -> str | None:
+    def _check_limits(self, stmt: exp.Expression, *, dialect: str = "duckdb") -> str | None:
+        if is_explain_statement(stmt):
+            if not is_explain_analyze(stmt):
+                return None
+            try:
+                stmt = unwrap_explain(stmt, dialect=dialect)
+            except ValueError as exc:
+                return str(exc)
         max_limit = self.policies.sql_guard.max_limit
         for limit_node in [*stmt.find_all(exp.Limit), *stmt.find_all(exp.Fetch)]:
             limit_options = limit_node.args.get("limit_options")
@@ -650,22 +774,28 @@ class SqlGuardHook(PreToolUseHook):
 
         return has_mode and seen_partition_col
 
-    def _check_partitions(self, stmt: exp.Expression) -> str | None:
+    def _check_partitions(self, stmt: exp.Expression, *, dialect: str = "duckdb") -> str | None:
         if is_explain_statement(stmt):
             if not is_explain_analyze(stmt):
                 return None
             try:
-                stmt = unwrap_explain(stmt)
+                stmt = unwrap_explain(stmt, dialect=dialect)
             except ValueError as exc:
                 return str(exc)
         if isinstance(stmt, exp.Describe):
             return None
         partitioned = {
-            tbl.lower(): {c.lower() for c in cols}
+            tbl.lower(): {c.lower() for c in cols if str(c).strip()}
             for tbl, cols in self.policies.partitioned_tables.items()
+            if any(str(c).strip() for c in cols)
         }
         if not partitioned:
             return None
+
+        short_partitioned: dict[str, set[str]] = {}
+        for tbl_key, p_cols in partitioned.items():
+            short = tbl_key.rsplit(".", 1)[-1]
+            short_partitioned.setdefault(short, set()).update(p_cols)
 
         root = build_scope(stmt)
         if root is None:
@@ -681,12 +811,24 @@ class SqlGuardHook(PreToolUseHook):
             for alias_key, (table_node, source) in scope.selected_sources.items():
                 quals = {alias_key.lower()}
                 if isinstance(source, exp.Table) and source.name:
+                    cat = (source.catalog or "").lower()
+                    db = (source.db or "").lower()
                     t_name = source.name.lower()
                     if not (isinstance(table_node, exp.Table) and table_node.alias):
                         quals.add(t_name)
                     node_to_quals[id(table_node)] = quals
-                    if t_name in partitioned:
-                        bindings.append((t_name, quals, partitioned[t_name], table_node))
+                    candidates = [
+                        ".".join(p for p in (cat, db, t_name) if p),
+                        ".".join(p for p in (db, t_name) if p),
+                        t_name,
+                    ]
+                    matched_cols = next(
+                        (partitioned[cand] for cand in candidates if cand in partitioned), None
+                    )
+                    if matched_cols is None:
+                        matched_cols = short_partitioned.get(t_name)
+                    if matched_cols:
+                        bindings.append((t_name, quals, matched_cols, table_node))
 
             if not bindings:
                 continue
@@ -838,16 +980,20 @@ class SqlGuardHook(PreToolUseHook):
             return PreToolDecision(action="allow")
 
         sql = str(tool_call.arguments.get("sql") or "")
+        engine_arg = str(tool_call.arguments.get("engine") or "").strip().lower()
+        effective_dialect = (
+            "spark" if engine_arg == "spark" else self.dialect
+        )
         try:
-            stmt = parse_single_statement(sql)
+            stmt = parse_single_statement(sql, dialect=effective_dialect)
         except ValueError as exc:
             return PreToolDecision(action="block", reason=str(exc))
 
-        if reason := self._validate_statement(stmt):
+        if reason := self._validate_statement(stmt, dialect=effective_dialect):
             return PreToolDecision(action="block", reason=reason)
-        if reason := self._check_limits(stmt):
+        if reason := self._check_limits(stmt, dialect=effective_dialect):
             return PreToolDecision(action="block", reason=reason)
-        if reason := self._check_partitions(stmt):
+        if reason := self._check_partitions(stmt, dialect=effective_dialect):
             return PreToolDecision(action="block", reason=reason)
 
         if (
@@ -856,7 +1002,7 @@ class SqlGuardHook(PreToolUseHook):
             and not _is_pure_scalar_or_aggregate(stmt)
         ):
             max_limit = self.policies.sql_guard.max_limit
-            rewritten_sql = stmt.limit(max_limit).sql(dialect="duckdb")
+            rewritten_sql = stmt.limit(max_limit).sql(dialect=effective_dialect)
             modified_args = dict(tool_call.arguments)
             modified_args["sql"] = rewritten_sql
             return PreToolDecision(
