@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from src.core.project import ResolvedProject
 
 
 class LakehousePaths(BaseModel):
@@ -30,6 +33,22 @@ class LakehousePaths(BaseModel):
             prod_duckdb_path=prod_mart_dir / "warehouse.duckdb",
             dbt_project_dir=root / "dbt_project",
             spark_jobs_dir=root / "spark_jobs",
+        )
+
+    @classmethod
+    def from_project(cls, project: ResolvedProject) -> LakehousePaths:
+        """Build directory and database bindings from a discovered `ResolvedProject`."""
+        root = project.repo_root.resolve()
+        lakehouse_dir = project.lakehouse_dir or (root / "lakehouse")
+        prod_mart_dir = lakehouse_dir / "prod" / "mart"
+        return cls(
+            workspace_dir=root,
+            raw_dir=lakehouse_dir / "raw",
+            prod_silver_dir=lakehouse_dir / "prod" / "silver",
+            prod_mart_dir=prod_mart_dir,
+            prod_duckdb_path=project.duckdb_path or (prod_mart_dir / "warehouse.duckdb"),
+            dbt_project_dir=project.dbt_project_dir or (root / "dbt_project"),
+            spark_jobs_dir=project.spark_jobs_dir or (root / "spark_jobs"),
         )
 
 
@@ -103,12 +122,14 @@ class LineageTestRef(BaseModel):
 
 
 class LineageNode(BaseModel):
-    """Unified asset representation across raw, Spark, and dbt layers."""
+    """Unified asset representation across raw, Spark, dbt, and external OpenLineage layers."""
 
     name: str
-    engine: Literal["raw", "spark", "dbt"]
+    engine: Literal["raw", "spark", "dbt", "external"]
     layer: str
     file_path: str | None = None
+    namespace: str | None = None
+    tags: list[str] = Field(default_factory=list)
     columns: list[str] = Field(default_factory=list)
     partition_columns: list[str] = Field(default_factory=list)
     pii_columns: list[str] = Field(default_factory=list)
@@ -204,6 +225,14 @@ class LineageAdapterBase(ABC):
     @abstractmethod
     def affected_downstream(self, changed_paths: list[str]) -> AffectedSubgraph:
         """Resolve changed workspace file paths to their impacted Spark and dbt subgraph."""
+
+    def all_aliases(self) -> dict[str, str]:
+        """Return known alias -> canonical asset name mappings when supported."""
+        return {}
+
+    def topological_order(self, assets: list[str] | None = None) -> list[str]:
+        """Return assets in deterministic upstream-to-downstream order when supported."""
+        return list(assets or [])
 
 
 class StorageAdapter(ABC):

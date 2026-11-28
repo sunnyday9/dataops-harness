@@ -4,35 +4,73 @@ import re
 import shutil
 import subprocess
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
 import duckdb
 import yaml
+from pydantic import BaseModel
 
-from src.adapters.base import DataDiffSummary, LakehousePaths, LineageAdapterBase
+from src.adapters.base import DataDiffSummary, LakehousePaths, LineageAdapterBase, LineageNode
 from src.adapters.duckdb_adapter import DuckDBAdapter
 from src.adapters.lineage_adapter import LineageAdapter
 from src.adapters.spark_adapter import SparkJobRunner
+from src.core.project import ResolvedProject, _read_dbt_project_yml, discover_project
 from src.core.rca import OracleVerdict, ShadowVerificationResult
 from src.core.worktree import RunWorktreeManager
-
-SPARK_JOB_ORDER: tuple[str, ...] = (
-    "spark_jobs/build_silver_users.py",
-    "spark_jobs/build_silver_exchange_rates.py",
-    "spark_jobs/build_silver_orders.py",
-)
-SPARK_JOB_TO_TABLE: dict[str, str] = {
-    "spark_jobs/build_silver_users.py": "silver_users",
-    "spark_jobs/build_silver_exchange_rates.py": "silver_exchange_rates",
-    "spark_jobs/build_silver_orders.py": "silver_orders",
-}
 
 DbtExecutor = Callable[
     [LakehousePaths, dict[str, Path], Path, list[str]],
     subprocess.CompletedProcess[str],
 ]
+
+
+class MetricReconciliationRule(BaseModel):
+    """Declarative cross-table sum reconciliation check evaluated when both tables exist."""
+
+    label: str = "metric_reconciliation"
+    left_table: str
+    left_column: str
+    right_table: str
+    right_column: str
+    tolerance: float = 0.01
+    require_positive: bool = True
+
+
+_DEFAULT_OPTIONAL_RECONCILIATION_RULES: tuple[MetricReconciliationRule, ...] = (
+    MetricReconciliationRule(
+        label="Mart GMV",
+        left_table="fct_daily_gmv",
+        left_column="net_gmv_usd",
+        right_table="dim_user_ltv",
+        right_column="lifetime_gmv_usd",
+        tolerance=0.01,
+        require_positive=True,
+    ),
+)
+
+
+def _quote_sql_ident(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
+def _resolve_dbt_subdir(root: Path, dbt_project_rel: str | None = None) -> tuple[str, Path]:
+    if dbt_project_rel is not None:
+        cleaned = dbt_project_rel.strip("/").replace("\\", "/")
+        return cleaned, ((root / cleaned).resolve() if cleaned else root.resolve())
+    if (root / "dbt_project.yml").is_file():
+        return "", root.resolve()
+    if root.is_dir():
+        try:
+            project = discover_project(root)
+            if project.dbt_project_dir is not None:
+                return project.dbt_project_rel, project.dbt_project_dir
+        except FileNotFoundError:
+            pass
+    if (root / "dbt_project").is_dir():
+        return "dbt_project", (root / "dbt_project").resolve()
+    return "", root.resolve()
 
 
 def _default_dbt_executor(
@@ -78,12 +116,60 @@ def _normalize_test_config(entry: Any) -> dict[str, Any]:
     return cfg
 
 
+def _normalize_dbt_rel_paths(raw: Any, defaults: Sequence[str]) -> list[str]:
+    entries = raw if isinstance(raw, list) else defaults
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in entries:
+        cleaned = str(item).strip().replace("\\", "/")
+        if not cleaned or cleaned.startswith(("/", "~")):
+            continue
+        while cleaned.startswith("./"):
+            cleaned = cleaned[2:]
+        cleaned = cleaned.strip("/")
+        if not cleaned or any(seg == ".." for seg in cleaned.split("/")):
+            continue
+        if cleaned not in seen:
+            normalized.append(cleaned)
+            seen.add(cleaned)
+    return normalized or list(defaults)
+
+
+def _read_dbt_subpaths(dbt_dir: Path) -> dict[str, list[str]]:
+    dbt_cfg = _read_dbt_project_yml(dbt_dir)
+    raw_models = dbt_cfg.get("model-paths")
+    if not isinstance(raw_models, list):
+        raw_models = dbt_cfg.get("source-paths")
+    return {
+        "model-paths": _normalize_dbt_rel_paths(raw_models, ["models"]),
+        "test-paths": _normalize_dbt_rel_paths(dbt_cfg.get("test-paths"), ["tests"]),
+        "macro-paths": _normalize_dbt_rel_paths(dbt_cfg.get("macro-paths"), ["macros"]),
+        "seed-paths": _normalize_dbt_rel_paths(dbt_cfg.get("seed-paths"), ["seeds"]),
+        "snapshot-paths": _normalize_dbt_rel_paths(dbt_cfg.get("snapshot-paths"), ["snapshots"]),
+    }
+
+
+def _iter_schema_yaml_files(dbt_dir: Path) -> list[Path]:
+    subpaths = _read_dbt_subpaths(dbt_dir)
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for rel_dir in (
+        subpaths["model-paths"] + subpaths["seed-paths"] + subpaths["snapshot-paths"]
+    ):
+        cand_dir = dbt_dir / rel_dir
+        if not cand_dir.is_dir():
+            continue
+        for yml_path in sorted({*cand_dir.rglob("*.yml"), *cand_dir.rglob("*.yaml")}):
+            resolved = yml_path.resolve()
+            if yml_path.is_file() and resolved not in seen:
+                seen.add(resolved)
+                files.append(yml_path)
+    return files
+
+
 def _collect_schema_tests(dbt_dir: Path) -> Counter[tuple[str, str]]:
     counts: Counter[tuple[str, str]] = Counter()
-    models_dir = dbt_dir / "models"
-    if not models_dir.is_dir():
-        return counts
-    for yml_path in sorted(models_dir.rglob("*.yml")):
+    for yml_path in _iter_schema_yaml_files(dbt_dir):
         loaded = yaml.safe_load(yml_path.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             continue
@@ -104,10 +190,7 @@ def _collect_schema_tests(dbt_dir: Path) -> Counter[tuple[str, str]]:
 
 def _collect_schema_test_configs(dbt_dir: Path) -> dict[tuple[str, str], list[dict[str, Any]]]:
     configs: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    models_dir = dbt_dir / "models"
-    if not models_dir.is_dir():
-        return configs
-    for yml_path in sorted(models_dir.rglob("*.yml")):
+    for yml_path in _iter_schema_yaml_files(dbt_dir):
         loaded = yaml.safe_load(yml_path.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             continue
@@ -153,7 +236,17 @@ class HiddenRegressionOracle(Protocol):
 
 
 class DefaultIntegrityOracle:
-    """Default regression oracle guarding test preservation and mart GMV conservation."""
+    """Default regression oracle guarding test preservation and optional metric reconciliation."""
+
+    def __init__(
+        self,
+        reconciliation_rules: Sequence[MetricReconciliationRule] | None = None,
+    ) -> None:
+        self.reconciliation_rules: tuple[MetricReconciliationRule, ...] = (
+            _DEFAULT_OPTIONAL_RECONCILIATION_RULES
+            if reconciliation_rules is None
+            else tuple(reconciliation_rules)
+        )
 
     def verify(
         self,
@@ -168,28 +261,38 @@ class DefaultIntegrityOracle:
         reasons: list[str] = []
         metrics: dict[str, Any] = {}
 
-        prod_dbt = prod_workspace / "dbt_project"
-        wt_dbt = worktree_dir / "dbt_project"
+        dbt_rel, prod_dbt = _resolve_dbt_subdir(prod_workspace)
+        wt_dbt = (worktree_dir / dbt_rel) if dbt_rel else worktree_dir
 
         # 1. Singular dbt test files must not be deleted, emptied, or neutralized.
-        prod_tests_dir = prod_dbt / "tests"
-        wt_tests_dir = wt_dbt / "tests"
-        if prod_tests_dir.is_dir():
-            for test_sql in sorted(prod_tests_dir.glob("*.sql")):
-                wt_sql = wt_tests_dir / test_sql.name
+        test_rel_dirs = _read_dbt_subpaths(prod_dbt)["test-paths"]
+        seen_test_files: set[Path] = set()
+        for test_rel_dir in test_rel_dirs:
+            prod_tests_dir = prod_dbt / test_rel_dir
+            wt_tests_dir = wt_dbt / test_rel_dir
+            if not prod_tests_dir.is_dir():
+                continue
+            for test_sql in sorted(prod_tests_dir.rglob("*.sql")):
+                resolved_sql = test_sql.resolve()
+                if not test_sql.is_file() or resolved_sql in seen_test_files:
+                    continue
+                seen_test_files.add(resolved_sql)
+                rel_sql = test_sql.relative_to(prod_tests_dir)
+                wt_sql = wt_tests_dir / rel_sql
+                display_rel = f"{test_rel_dir}/{rel_sql.as_posix()}"
                 if not wt_sql.is_file() or not wt_sql.read_text(encoding="utf-8").strip():
-                    reasons.append(f"Singular dbt test deleted or emptied: tests/{test_sql.name}")
+                    reasons.append(f"Singular dbt test deleted or emptied: {display_rel}")
                     continue
                 prod_text = test_sql.read_text(encoding="utf-8")
                 wt_text = wt_sql.read_text(encoding="utf-8")
                 if " ".join(prod_text.split()) != " ".join(wt_text.split()):
                     if _NEUTRALIZED_TEST_RE.search(wt_text):
                         reasons.append(
-                            f"Singular dbt test neutralized with falsifying condition: tests/{test_sql.name}"
+                            f"Singular dbt test neutralized with falsifying condition: {display_rel}"
                         )
                     elif _DBT_REF_SOURCE_RE.search(prod_text) and not _DBT_REF_SOURCE_RE.search(wt_text):
                         reasons.append(
-                            f"Singular dbt test stripped model/source refs: tests/{test_sql.name}"
+                            f"Singular dbt test stripped model/source refs: {display_rel}"
                         )
 
         # 2. Schema tests in models/**/*.yml must not be removed or weakened.
@@ -217,8 +320,8 @@ class DefaultIntegrityOracle:
                 if "where" in w_cfg and w_cfg.get("where") != p_cfg.get("where"):
                     reasons.append(f"Schema dbt test weakened with custom where filter on {key[0]} ({key[1]}).")
 
-        # 3. Mart GMV conservation check if both mart tables exist in DuckDB.
-        if shadow_duckdb_path.is_file():
+        # 3. Declarative metric reconciliation check if matching tables exist in DuckDB.
+        if self.reconciliation_rules and shadow_duckdb_path.is_file():
             con = duckdb.connect(str(shadow_duckdb_path), read_only=True)
             try:
                 tables = {
@@ -228,26 +331,29 @@ class DefaultIntegrityOracle:
                         "WHERE table_schema = 'main'"
                     ).fetchall()
                 }
-                if "fct_daily_gmv" in tables and "dim_user_ltv" in tables:
-                    fct_total = float(
-                        con.execute("SELECT COALESCE(SUM(net_gmv_usd), 0.0) FROM fct_daily_gmv;")
-                        .fetchone()[0]
+                for rule in self.reconciliation_rules:
+                    if rule.left_table not in tables or rule.right_table not in tables:
+                        continue
+                    q_lt = _quote_sql_ident(rule.left_table)
+                    q_lc = _quote_sql_ident(rule.left_column)
+                    q_rt = _quote_sql_ident(rule.right_table)
+                    q_rc = _quote_sql_ident(rule.right_column)
+                    left_total = float(
+                        con.execute(f"SELECT COALESCE(SUM({q_lc}), 0.0) FROM {q_lt};").fetchone()[0]
                     )
-                    dim_total = float(
-                        con.execute(
-                            "SELECT COALESCE(SUM(lifetime_gmv_usd), 0.0) FROM dim_user_ltv;"
-                        ).fetchone()[0]
+                    right_total = float(
+                        con.execute(f"SELECT COALESCE(SUM({q_rc}), 0.0) FROM {q_rt};").fetchone()[0]
                     )
-                    metrics["fct_daily_gmv_total"] = round(fct_total, 4)
-                    metrics["dim_user_ltv_total"] = round(dim_total, 4)
-                    if fct_total <= 0 or dim_total <= 0:
+                    metrics[f"{rule.left_table}_total"] = round(left_total, 4)
+                    metrics[f"{rule.right_table}_total"] = round(right_total, 4)
+                    if rule.require_positive and (left_total <= 0 or right_total <= 0):
                         reasons.append(
-                            f"Mart GMV totals must be positive (fct={fct_total}, dim={dim_total})."
+                            f"{rule.label} totals must be positive (fct={left_total}, dim={right_total})."
                         )
-                    elif abs(fct_total - dim_total) > 0.01:
+                    elif abs(left_total - right_total) > rule.tolerance:
                         reasons.append(
-                            f"Mart GMV reconciliation drift exceeded $0.01 "
-                            f"(fct={fct_total:.2f}, dim={dim_total:.2f})."
+                            f"{rule.label} reconciliation drift exceeded ${rule.tolerance:.2f} "
+                            f"(fct={left_total:.2f}, dim={right_total:.2f})."
                         )
             finally:
                 con.close()
@@ -260,13 +366,40 @@ class DefaultIntegrityOracle:
         )
 
 
-def order_spark_jobs(spark_jobs: list[str]) -> list[str]:
-    """Sort affected Spark jobs in deterministic upstream-to-downstream order."""
-    ordered = [job for job in SPARK_JOB_ORDER if job in spark_jobs]
-    for job in spark_jobs:
-        if job not in ordered:
-            ordered.append(job)
-    return ordered
+def order_spark_jobs(
+    spark_jobs: Sequence[str],
+    lineage_adapter: LineageAdapterBase | None = None,
+) -> list[str]:
+    """Sort affected Spark jobs in deterministic upstream-to-downstream lineage order."""
+    if not spark_jobs:
+        return []
+    ordered_fn = getattr(lineage_adapter, "ordered_spark_jobs", None) if lineage_adapter else None
+    if callable(ordered_fn):
+        return list(ordered_fn(spark_jobs))
+
+    all_nodes_fn = getattr(lineage_adapter, "all_nodes", None) if lineage_adapter else None
+    if lineage_adapter is not None and callable(all_nodes_fn):
+        nodes = all_nodes_fn()
+        if isinstance(nodes, dict):
+            path_to_asset = {
+                node.file_path: name
+                for name, node in nodes.items()
+                if node.engine == "spark" and node.file_path
+            }
+            topo_assets = lineage_adapter.topological_order(
+                [path_to_asset[j] for j in spark_jobs if j in path_to_asset]
+            )
+            ordered = [
+                nodes[asset].file_path
+                for asset in topo_assets
+                if asset in nodes and nodes[asset].file_path in spark_jobs
+            ]
+            for job in sorted(spark_jobs):
+                if job not in ordered:
+                    ordered.append(job)
+            return ordered
+
+    return sorted(dict.fromkeys(spark_jobs))
 
 
 _INCREMENTAL_BLOCK_RE = re.compile(
@@ -280,13 +413,53 @@ def extract_incremental_blocks(text: str) -> list[str]:
     return [" ".join(match.group(1).split()) for match in _INCREMENTAL_BLOCK_RE.finditer(text)]
 
 
+def _is_dbt_model_sql(
+    norm_path: str,
+    dbt_project_rel: str | None,
+    model_paths: Sequence[str] | None = None,
+) -> bool:
+    if not norm_path.endswith(".sql"):
+        return False
+    if dbt_project_rel is not None:
+        cleaned = dbt_project_rel.strip("/").replace("\\", "/")
+        prefix = f"{cleaned}/" if cleaned else ""
+        if model_paths is not None:
+            return any(norm_path.startswith(f"{prefix}{mp}/") for mp in model_paths)
+        if not norm_path.startswith(prefix):
+            return False
+        rel_in_dbt = norm_path[len(prefix) :]
+        return not rel_in_dbt.startswith(("tests/", "macros/", "target/", "logs/"))
+    return norm_path.startswith("models/") or "/models/" in norm_path
+
+
 def touches_incremental_logic(
-    prod_workspace: Path, worktree_dir: Path, changed_files: list[str]
+    prod_workspace: Path,
+    worktree_dir: Path,
+    changed_files: list[str],
+    *,
+    dbt_project_rel: str | None = None,
 ) -> bool:
     """Return True if any changed dbt model alters content inside `is_incremental()`."""
+    effective_rel = dbt_project_rel
+    model_paths: list[str] | None = None
+    if effective_rel is not None:
+        cleaned_rel = effective_rel.strip("/").replace("\\", "/")
+        for base in (prod_workspace, worktree_dir):
+            cand_dir = (base / cleaned_rel) if cleaned_rel else base
+            if (cand_dir / "dbt_project.yml").is_file():
+                model_paths = _read_dbt_subpaths(cand_dir)["model-paths"]
+                break
+    else:
+        for base in (prod_workspace, worktree_dir):
+            found_rel, found_dir = _resolve_dbt_subdir(base)
+            if (found_dir / "dbt_project.yml").is_file():
+                effective_rel = found_rel
+                model_paths = _read_dbt_subpaths(found_dir)["model-paths"]
+                break
+
     for rel in changed_files:
         norm = rel.replace("\\", "/").lstrip("./")
-        if not (norm.startswith("dbt_project/models/") and norm.endswith(".sql")):
+        if not _is_dbt_model_sql(norm, effective_rel, model_paths=model_paths):
             continue
         prod_file = prod_workspace / norm
         wt_file = worktree_dir / norm
@@ -305,6 +478,37 @@ def touches_incremental_logic(
     return False
 
 
+def _infer_key_column(node: LineageNode) -> str | None:
+    for test in node.tests:
+        if test.test_type == "unique" and test.column_name:
+            return test.column_name
+    if node.partition_columns:
+        return node.partition_columns[0]
+    for col in node.columns:
+        if col == "id" or col.endswith(("_id", "_date")):
+            return col
+    return node.columns[0] if node.columns else None
+
+
+def _discover_mart_diff_targets(lineage: LineageAdapterBase | None) -> list[tuple[str, str]]:
+    if lineage is None:
+        return []
+    all_nodes_fn = getattr(lineage, "all_nodes", None)
+    if not callable(all_nodes_fn):
+        return []
+    nodes = all_nodes_fn()
+    if not isinstance(nodes, dict):
+        return []
+    targets: list[tuple[str, str]] = []
+    for name in sorted(nodes):
+        node = nodes[name]
+        if node.engine == "dbt" and node.layer == "mart":
+            key_col = _infer_key_column(node)
+            if key_col:
+                targets.append((node.name, key_col))
+    return targets
+
+
 def execute_pipeline_subset(
     *,
     code_workspace: Path,
@@ -318,6 +522,8 @@ def execute_pipeline_subset(
     spark_runner: SparkJobRunner,
     dbt_executor: DbtExecutor,
     full_refresh: bool = True,
+    lineage_adapter: LineageAdapterBase | None = None,
+    dbt_project_rel: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Path], bool, bool, str, str, list[str]]:
     """Run affected Spark jobs then dbt models/tests against target silver and DuckDB paths."""
     failure_reasons: list[str] = []
@@ -327,17 +533,51 @@ def execute_pipeline_subset(
     target_silver_dir.mkdir(parents=True, exist_ok=True)
     target_duckdb_path.parent.mkdir(parents=True, exist_ok=True)
 
+    lineage = lineage_adapter
+    if lineage is None and code_workspace.is_dir():
+        lineage = LineageAdapter.from_workspace(code_workspace)
+
+    all_nodes_fn = getattr(lineage, "all_nodes", None) if lineage is not None else None
+    all_nodes: dict[str, LineageNode] = all_nodes_fn() if callable(all_nodes_fn) else {}
+    job_to_table = {
+        node.file_path: name
+        for name, node in all_nodes.items()
+        if node.engine == "spark" and node.file_path
+    }
+
     # 1. Execute affected PySpark jobs into target_silver_dir using upstream shadow-over-prod read.
-    for job_rel in order_spark_jobs(affected_spark_jobs):
+    for job_rel in order_spark_jobs(affected_spark_jobs, lineage_adapter=lineage):
         script_path = code_workspace / job_rel
         if not script_path.is_file():
             failure_reasons.append(f"Affected Spark script missing: {job_rel}")
             continue
         args = ["--raw-dir", str(raw_dir), "--output-dir", str(target_silver_dir)]
-        if job_rel == "spark_jobs/build_silver_orders.py":
-            silver_read = (
-                target_silver_dir if "silver_users" in silver_overrides else prod_silver_dir
-            )
+        table_name = job_to_table.get(job_rel)
+        node = all_nodes.get(table_name) if table_name else None
+        upstream_spark_tables = [
+            up
+            for up in (node.upstream if node is not None else [])
+            if up in all_nodes and all_nodes[up].engine == "spark"
+        ]
+        if upstream_spark_tables:
+            has_shadow_upstream = any(up in silver_overrides for up in upstream_spark_tables)
+            if has_shadow_upstream:
+                for up in upstream_spark_tables:
+                    if up in silver_overrides:
+                        continue
+                    prod_up = prod_silver_dir / up
+                    tgt_up = target_silver_dir / up
+                    if prod_up.exists() and not tgt_up.exists():
+                        try:
+                            tgt_up.symlink_to(prod_up.resolve())
+                        except OSError:
+                            if prod_up.is_dir():
+                                shutil.copytree(prod_up, tgt_up, dirs_exist_ok=True)
+                            else:
+                                shutil.copy2(prod_up, tgt_up)
+                silver_read = target_silver_dir
+            else:
+                silver_read = prod_silver_dir
             args.extend(["--silver-read-dir", str(silver_read)])
 
         res = spark_runner.run_job(script_path, args=args)
@@ -349,15 +589,38 @@ def execute_pipeline_subset(
             )
             return spark_runs, silver_overrides, False, False, "", "", failure_reasons
 
-        if table_name := SPARK_JOB_TO_TABLE.get(job_rel):
+        if table_name:
             written = target_silver_dir / table_name
             if written.is_dir():
                 silver_overrides[table_name] = written.resolve()
 
-    # 2. Execute affected dbt run & dbt test inside code_workspace/dbt_project.
-    touches_dbt = bool(affected_dbt_models) or any(
-        path.startswith("dbt_project/") for path in changed_files
+    resolved_dbt_rel, resolved_dbt_dir = _resolve_dbt_subdir(code_workspace, dbt_project_rel)
+    has_dbt_project = (resolved_dbt_dir / "dbt_project.yml").is_file()
+    dbt_prefix = f"{resolved_dbt_rel}/" if resolved_dbt_rel else ""
+    subpaths = _read_dbt_subpaths(resolved_dbt_dir)
+    model_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["model-paths"])
+    test_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["test-paths"])
+    macro_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["macro-paths"])
+    seed_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["seed-paths"])
+    snapshot_prefixes = tuple(f"{dbt_prefix}{p}/" for p in subpaths["snapshot-paths"])
+    all_dbt_prefixes = (
+        model_prefixes + test_prefixes + macro_prefixes + seed_prefixes + snapshot_prefixes
     )
+    dbt_config_files = (f"{dbt_prefix}dbt_project.yml", f"{dbt_prefix}profiles.yml")
+    norm_changed = [path.replace("\\", "/").lstrip("./") for path in changed_files]
+
+    # 2. Execute affected dbt seed/run/test inside code_workspace's dbt project.
+    touches_dbt = bool(affected_dbt_models) or any(
+        (path.startswith(dbt_prefix) if dbt_prefix else False)
+        or path.startswith(all_dbt_prefixes)
+        or path in dbt_config_files
+        for path in norm_changed
+    )
+    if not has_dbt_project and not touches_dbt and dbt_executor is _default_dbt_executor:
+        if spark_runs:
+            return spark_runs, silver_overrides, True, True, "", "", failure_reasons
+        failure_reasons.append("Patched files do not map to any Spark job or dbt asset.")
+        return spark_runs, silver_overrides, False, False, "", "", failure_reasons
     if not touches_dbt and not spark_runs:
         failure_reasons.append("Patched files do not map to any Spark job or dbt asset.")
         return spark_runs, silver_overrides, False, False, "", "", failure_reasons
@@ -367,19 +630,50 @@ def execute_pipeline_subset(
             "raw_dir": raw_dir,
             "prod_silver_dir": prod_silver_dir,
             "prod_duckdb_path": target_duckdb_path,
+            "dbt_project_dir": resolved_dbt_dir,
         }
     )
 
+    touches_seeds = any(path.startswith(seed_prefixes) for path in norm_changed)
+    seed_stdout = ""
+    seed_stderr = ""
+    if touches_seeds:
+        seed_args = ["seed", "--full-refresh"] if full_refresh else ["seed"]
+        seed_proc = dbt_executor(dbt_paths, silver_overrides, target_duckdb_path, seed_args)
+        seed_stdout = seed_proc.stdout
+        seed_stderr = seed_proc.stderr
+        if seed_proc.returncode != 0:
+            err_msg = (seed_proc.stderr or seed_proc.stdout).strip()[-800:]
+            failure_reasons.append(f"dbt seed failed (rc={seed_proc.returncode}): {err_msg}")
+            return (
+                spark_runs,
+                silver_overrides,
+                False,
+                False,
+                seed_stdout,
+                seed_stderr,
+                failure_reasons,
+            )
+
     requires_full_dbt = any(
-        path.startswith(("dbt_project/macros/", "dbt_project/tests/", "spark_jobs/spark_config.py"))
-        or path.endswith((".yml", "profiles.yml", "dbt_project.yml"))
-        for path in changed_files
+        path.startswith(macro_prefixes + test_prefixes)
+        or path.endswith((".yml", ".yaml", "profiles.yml", "dbt_project.yml", "spark_config.py"))
+        for path in norm_changed
     )
+    inferred_models: list[str] = []
+    if not affected_dbt_models:
+        for path in norm_changed:
+            if path.endswith(".sql") and path.startswith(model_prefixes):
+                selector = f"{Path(path).stem}+"
+                if selector not in inferred_models:
+                    inferred_models.append(selector)
+
+    select_targets = list(affected_dbt_models) or inferred_models
     run_args = ["run"]
     if full_refresh:
         run_args.append("--full-refresh")
-    if not requires_full_dbt and affected_dbt_models:
-        run_args.extend(["--select", *affected_dbt_models])
+    if not requires_full_dbt and select_targets:
+        run_args.extend(["--select", *select_targets])
     run_proc = dbt_executor(dbt_paths, silver_overrides, target_duckdb_path, run_args)
     dbt_run_ok = run_proc.returncode == 0
     if not dbt_run_ok:
@@ -390,15 +684,15 @@ def execute_pipeline_subset(
             silver_overrides,
             False,
             False,
-            run_proc.stdout,
-            run_proc.stderr,
+            "\n".join(part for part in (seed_stdout, run_proc.stdout) if part),
+            "\n".join(part for part in (seed_stderr, run_proc.stderr) if part),
             failure_reasons,
         )
 
     test_proc = dbt_executor(dbt_paths, silver_overrides, target_duckdb_path, ["test"])
     dbt_test_ok = test_proc.returncode == 0
-    combined_stdout = "\n".join(part for part in (run_proc.stdout, test_proc.stdout) if part)
-    combined_stderr = "\n".join(part for part in (run_proc.stderr, test_proc.stderr) if part)
+    combined_stdout = "\n".join(part for part in (seed_stdout, run_proc.stdout, test_proc.stdout) if part)
+    combined_stderr = "\n".join(part for part in (seed_stderr, run_proc.stderr, test_proc.stderr) if part)
     if not dbt_test_ok:
         err_msg = (test_proc.stderr or test_proc.stdout).strip()[-800:]
         failure_reasons.append(f"dbt test failed (rc={test_proc.returncode}): {err_msg}")
@@ -426,12 +720,12 @@ class ShadowOverlayVerifier:
         oracle: HiddenRegressionOracle | None = None,
         spark_runner: SparkJobRunner | None = None,
         dbt_executor: DbtExecutor | None = None,
+        project: ResolvedProject | None = None,
     ) -> None:
         self.prod_workspace = prod_workspace.resolve()
         self.runs_dir = runs_dir.resolve()
-        self.lineage_adapter = lineage_adapter or LineageAdapter.from_workspace(
-            self.prod_workspace
-        )
+        self._project = project or discover_project(self.prod_workspace)
+        self.lineage_adapter = lineage_adapter or LineageAdapter.from_project(self._project)
         self.oracle: HiddenRegressionOracle = oracle or DefaultIntegrityOracle()
         self._custom_spark_runner = spark_runner
         self._dbt_executor: DbtExecutor = dbt_executor or _default_dbt_executor
@@ -441,12 +735,9 @@ class ShadowOverlayVerifier:
     ) -> list[DataDiffSummary]:
         if not (prod_duckdb_path.is_file() and shadow_duckdb_path.is_file()):
             return []
-        adapter = DuckDBAdapter(LakehousePaths.from_workspace(self.prod_workspace))
+        adapter = DuckDBAdapter(LakehousePaths.from_project(self._project))
         diffs: list[DataDiffSummary] = []
-        for table_name, key_col in (
-            ("fct_daily_gmv", "order_date"),
-            ("dim_user_ltv", "user_id"),
-        ):
+        for table_name, key_col in _discover_mart_diff_targets(self.lineage_adapter):
             try:
                 diffs.append(
                     adapter.data_diff(
@@ -463,10 +754,16 @@ class ShadowOverlayVerifier:
     def verify(self, run_id: str, worktree_dir: Path) -> ShadowVerificationResult:
         """Run affected Spark + dbt DAG in isolated shadow storage and validate via Oracle."""
         resolved_wt = worktree_dir.resolve()
+        prod_paths = LakehousePaths.from_project(self._project)
         shadow_root = self.runs_dir / run_id / "shadow"
         shadow_silver_dir = shadow_root / "silver"
         shadow_mart_dir = shadow_root / "mart"
-        shadow_duckdb_path = shadow_mart_dir / "warehouse.duckdb"
+        db_name = (
+            prod_paths.prod_duckdb_path.name
+            if prod_paths.prod_duckdb_path.name.endswith(".duckdb")
+            else "warehouse.duckdb"
+        )
+        shadow_duckdb_path = shadow_mart_dir / db_name
         shadow_events_dir = shadow_root / "spark_events"
 
         if shadow_root.exists():
@@ -486,7 +783,6 @@ class ShadowOverlayVerifier:
                 failure_reasons=["No modified or added files found in Run worktree."],
             )
 
-        prod_paths = LakehousePaths.from_workspace(self.prod_workspace)
         if prod_paths.prod_duckdb_path.is_file():
             shutil.copy2(prod_paths.prod_duckdb_path, shadow_duckdb_path)
 
@@ -516,8 +812,13 @@ class ShadowOverlayVerifier:
             spark_runner=spark_runner,
             dbt_executor=self._dbt_executor,
             full_refresh=not touches_incremental_logic(
-                self.prod_workspace, resolved_wt, changed_files
+                self.prod_workspace,
+                resolved_wt,
+                changed_files,
+                dbt_project_rel=self._project.dbt_project_rel,
             ),
+            lineage_adapter=self.lineage_adapter,
+            dbt_project_rel=self._project.dbt_project_rel,
         )
 
         oracle_verdict: OracleVerdict | None = None
